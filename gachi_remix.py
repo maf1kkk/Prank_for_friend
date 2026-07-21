@@ -1,237 +1,526 @@
-import os, sys, json, re, random, argparse, subprocess, tempfile, shutil, math
+"""
+Gachi Remix — автоматический gachi-ремикс любой песни.
+Основа: faster-whisper + Gemini AI + FFmpeg.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Any
 
-warnings_filter = None
-try:
-    import warnings; warnings.filterwarnings("ignore")
-except: pass
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("gachi_remix")
 
-SOUNDS_DIR = Path(__file__).parent / "sounds"
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
-GEMINI_PROMPT = """You are a music remix assistant. Given lyrics with timestamps,
-suggest where to insert gachi sound effects contextually.
-Return a JSON array of: [{"start": <seconds>, "sound": "<filename>"}]
+@dataclass
+class Placement:
+    start: float
+    sound: str
 
-Available sounds and their keywords:
+@dataclass
+class Word:
+    text: str
+    start: float
+    end: float
+
+@dataclass
+class Segment:
+    start: float
+    end: float
+    text: str
+    words: list[Word] = field(default_factory=list)
+
+@dataclass
+class SoundEntry:
+    path: str
+    keywords: list[str]
+
+# ---------------------------------------------------------------------------
+# Sound library
+# ---------------------------------------------------------------------------
+
+class SoundLibrary:
+    def __init__(self, sounds_dir: str | Path):
+        self.dir = Path(sounds_dir)
+        self.by_keyword: dict[str, list[str]] = {}
+        self.all_sounds: list[str] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.dir.exists():
+            log.warning("Sound directory not found: %s", self.dir)
+            return
+        for f in sorted(self.dir.iterdir()):
+            if f.suffix.lower() not in (".mp3", ".wav", ".ogg", ".flac", ".m4a"):
+                continue
+            self.all_sounds.append(str(f))
+            kws = self._extract_keywords(f)
+            for kw in kws:
+                self.by_keyword.setdefault(kw, []).append(str(f))
+
+    @staticmethod
+    def _extract_keywords(path: Path) -> list[str]:
+        name = path.stem.lower()
+        name = re.sub(r"voicy\d*", "", name)
+        name = re.sub(r"\d+", "", name)
+        name = re.sub(r"[_\-\s]+", " ", name).strip()
+        return [w for w in name.split() if len(w) > 1]
+
+    def random(self) -> str:
+        return random.choice(self.all_sounds) if self.all_sounds else ""
+
+    def match_by_rules(self, word_text: str, used: dict[str, int]) -> str | None:
+        wt = word_text.lower().strip(".,!?;:'\"")
+        if not wt:
+            return None
+        candidates: list[str] = []
+        for kw, files in self.by_keyword.items():
+            if kw in wt or wt in kw:
+                candidates.extend(files)
+        if not candidates:
+            return None
+        fresh = [f for f in candidates if used.get(f, 0) < 2]
+        return random.choice(fresh) if fresh else random.choice(candidates)
+
+    def lookup(self, name: str) -> str | None:
+        stem = Path(name).stem.lower()
+        for p in self.all_sounds:
+            if Path(p).stem.lower() == stem:
+                return p
+        return None
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+def get_duration(path: str | Path) -> float:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def check_ffmpeg() -> None:
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10)
+    except FileNotFoundError:
+        log.error("FFmpeg not found. Install it: https://ffmpeg.org/download.html")
+        sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
+
+_whisper_model_cache: dict[str, Any] = {}
+
+def transcribe(audio_path: str | Path, model_name: str, language: str | None,
+               device: str) -> list[Segment]:
+    from faster_whisper import WhisperModel
+
+    if model_name not in _whisper_model_cache:
+        log.info("Loading whisper model '%s' on %s...", model_name, device)
+        _whisper_model_cache[model_name] = WhisperModel(
+            model_name, device=device, compute_type="float32",
+        )
+    model = _whisper_model_cache[model_name]
+
+    log.info("Transcribing...")
+    t0 = time.time()
+    segments_gen, info = model.transcribe(
+        str(audio_path), language=language or None, word_timestamps=True,
+    )
+    segments: list[Segment] = []
+    for seg in segments_gen:
+        words = []
+        for w in seg.words or []:
+            words.append(Word(text=w.word.strip(), start=w.start, end=w.end))
+        segments.append(Segment(
+            start=seg.start, end=seg.end,
+            text=(seg.text or "").strip(), words=words,
+        ))
+    log.info("  Lang: %s (%.0f%%) | %d seg | %.1fs",
+             info.language, info.language_probability * 100,
+             len(segments), time.time() - t0)
+    return segments
+
+# ---------------------------------------------------------------------------
+# Gemini matcher
+# ---------------------------------------------------------------------------
+
+GEMINI_SYSTEM = """You are a music remix engineer. Given song lyrics with timestamps,
+suggest where to insert gachi sound effects for maximum comedic/rhythmic effect.
+
+Available sounds (keyword -> filename):
 {sound_list}
 
 Rules:
-- Match sound keywords to nearby lyrics contextually (e.g. "cum" -> cumming, "fuck" -> fuck)
-- Place sounds right BEFORE the relevant word
-- 2-5 inserts per minute feels natural
-- Return ONLY the JSON array, no other text
+- Match sounds to contextual words or nearby words in the lyrics
+- Place the sound RIGHT BEFORE the relevant word (not on it)
+- 2-5 inserts per minute for natural feel
+- Prioritize: cum/fuck/yeah/ah/oh/slap sounds at lewd/excited moments
+- If the song has no vocals / is instrumental, suggest random placements evenly spaced
+- Be creative — think like a DJ making a mashup
 
-Lyrics with timestamps:
-{lyrics}"""
+Return ONLY a JSON array of {{"start": <seconds>, "sound": "<filename>"}}.
+No markdown, no explanation."""
 
-def extract_keywords(path):
-    name = Path(path).stem.lower()
-    name = re.sub(r'[_\-\s]+', ' ', name)
-    name = re.sub(r'voicy\d*', '', name)
-    name = re.sub(r'\d+', '', name)
-    return [w for w in name.split() if len(w) > 1]
-
-def build_sound_map(sounds_dir):
-    sounds_dir = Path(sounds_dir)
-    if not sounds_dir.exists():
-        print(f"No sounds directory: {sounds_dir}")
-        return {}
-    sound_map = {}
-    for f in sorted(sounds_dir.iterdir()):
-        if f.suffix.lower() in (".mp3", ".wav", ".ogg", ".flac", ".m4a"):
-            kws = extract_keywords(f)
-            if kws:
-                for kw in kws:
-                    sound_map.setdefault(kw, []).append(str(f))
-            sound_map.setdefault("_all", []).append(str(f))
-    return sound_map
-
-def match_rules(word_text, sound_map, used_sounds):
-    wt = word_text.lower().strip(".,!?;:'\"")
-    if not wt:
-        return None
-    best = []
-    for kw, files in sound_map.items():
-        if kw == "_all":
-            continue
-        if kw in wt or wt in kw:
-            best.extend(files)
-    if not best:
-        return None
-    candidates = [f for f in best if used_sounds.get(f, 0) < 2]
-    return random.choice(candidates) if candidates else random.choice(best)
-
-def match_with_gemini(segments, sound_map, api_key):
+def gemini_match(segments: list[Segment], library: SoundLibrary,
+                 api_key: str) -> list[Placement]:
     from google import genai
+    from google.genai import types
+
     client = genai.Client(api_key=api_key)
-    sound_list = "\n".join(f"- {Path(f).stem}" for f in sound_map.get("_all", []))
+
+    sound_lines = sorted(set(
+        f"{kw:12s} -> {Path(v).stem}"
+        for kw, vals in library.by_keyword.items()
+        for v in vals[:2]
+    ))
+    sound_list = "\n".join(sound_lines[:60])
+
     lyrics_lines = []
     for seg in segments:
-        for w in seg.get("words", []):
-            lyrics_lines.append(f"[{w['start']:.2f}] {w['text']}")
+        for w in seg.words:
+            lyrics_lines.append(f"[{w.start:7.2f}] {w.text}")
+    if not lyrics_lines:
+        lyrics_lines = [f"[{seg.start:.2f}] {seg.text}" for seg in segments]
     lyrics = "\n".join(lyrics_lines)
-    prompt = GEMINI_PROMPT.format(sound_list=sound_list, lyrics=lyrics)
-    resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-    try:
-        text = resp.text.strip()
-        text = re.sub(r'^```(?:json)?\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-        return json.loads(text)
-    except Exception as e:
-        print(f"Gemini parse error: {e}")
-        print(f"Raw: {resp.text[:500]}")
-        return []
 
-def get_audio_duration(path):
-    r = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
-    try:
-        return float(r.stdout.strip())
-    except:
-        return 0
+    full_prompt = GEMINI_SYSTEM.format(sound_list=sound_list)
+    full_prompt += f"\n\nLyrics:\n{lyrics}"
 
-def transcribe(audio_path, model_name, language, device):
-    from faster_whisper import WhisperModel
-    model = WhisperModel(model_name, device=device, compute_type="float32")
-    print(f"Transcribing with {model_name}...")
-    segments, info = model.transcribe(str(audio_path), language=language or None, word_timestamps=True)
-    result = []
-    for seg in segments:
-        words = []
-        for w in (seg.words or []):
-            words.append({"text": w.word.strip(), "start": w.start, "end": w.end})
-        result.append({"start": seg.start, "end": seg.end, "text": (seg.text or "").strip(), "words": words})
-    print(f"  Language: {info.language} ({info.language_probability:.1%}), segments: {len(result)}")
-    return result
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.7,
+                    max_output_tokens=4096,
+                ),
+            )
+            text = resp.text.strip()
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            data = json.loads(text)
+            placements = []
+            for item in data:
+                spath = library.lookup(item.get("sound", ""))
+                if spath:
+                    placements.append(Placement(
+                        start=float(item["start"]),
+                        sound=spath,
+                    ))
+            return placements
+        except json.JSONDecodeError:
+            log.warning("  Gemini: malformed JSON (attempt %d)", attempt + 1)
+        except Exception as exc:
+            log.warning("  Gemini: %s (attempt %d)", exc, attempt + 1)
+        time.sleep(1)
+    return []
 
-def find_pauses(segments, min_pause=0.5):
-    words = [w for seg in segments for w in seg.get("words", [])]
+# ---------------------------------------------------------------------------
+# Rules matcher
+# ---------------------------------------------------------------------------
+
+def find_pauses(segments: list[Segment], min_gap: float = 0.5) -> list[dict]:
+    words = [w for seg in segments for w in seg.words]
     pauses = []
     for i in range(len(words) - 1):
-        gap = words[i + 1]["start"] - words[i]["end"]
-        if gap >= min_pause:
-            pauses.append({"start": words[i]["end"], "end": words[i + 1]["start"], "duration": gap})
+        gap = words[i + 1].start - words[i].end
+        if gap >= min_gap:
+            pauses.append({"start": words[i].end, "end": words[i + 1].start})
     return pauses
 
-def ffmpeg_mix(original_path, placements, output_path, volume_pct):
-    tmpdir = Path(tempfile.mkdtemp())
-    try:
-        dur = get_audio_duration(original_path)
-        if dur <= 0:
-            dur = 30
-        dur_ms = int(dur * 1000)
-        delay_inputs = []
-        delay_filters = []
-        for i, p in enumerate(placements):
-            spath = p["sound"]
-            if not os.path.exists(spath):
-                alt = Path(SOUNDS_DIR) / Path(spath).name
-                if alt.exists():
-                    spath = str(alt)
-                else:
-                    alt2 = Path(__file__).parent / "sounds" / Path(spath).name
-                    if alt2.exists():
-                        spath = str(alt2)
-                    else:
-                        print(f"  Not found: {spath}")
-                        continue
-            delay_ms = int(p["start"] * 1000)
-            if delay_ms > dur_ms:
-                continue
-            label = f"s{i}"
-            delay_inputs.append(f"-i")
-            delay_inputs.append(spath)
-            delay_filters.append(f"[{i+1}:a]volume={volume_pct/100}[a{i}];")
-            delay_filters.append(f"[a{i}]adelay={delay_ms}|{delay_ms}[{label}];")
-        if not delay_filters:
-            print("No sounds to place!")
-            shutil.copy2(original_path, output_path)
-            return
-        filter_str = "".join(delay_filters)
-        mix_inputs = "[0:a]" + "".join(f"[{l}]" for l in [f"s{i}" for i in range(len(placements))])
-        filter_str += f"{mix_inputs}amix=inputs={len(placements)+1}:duration=first"
-        print(f"Mixing {len(placements)} sounds via FFmpeg...")
-        cmd = ["ffmpeg", "-y", "-i", original_path] + delay_inputs + \
-              ["-filter_complex", filter_str, "-ac", "2", "-b:a", "192k", str(output_path)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            errors = [l for l in r.stderr.split("\n") if "error" in l.lower() or "invalid" in l.lower()]
-            for e in errors[:5]:
-                print(f"  FFmpeg: {e.strip()}")
-            if not errors:
-                print("  FFmpeg failed (see output)")
-            shutil.copy2(original_path, output_path)
-            print(f"  Original copied (no mix): {output_path}")
-        else:
-            print(f"Done: {output_path}")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+# ---------------------------------------------------------------------------
+# FFmpeg mixer
+# ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Gachi Remix — автоматический gachi-ремикс любой песни")
-    parser.add_argument("input", help="Путь к аудиофайлу")
-    parser.add_argument("--sounds", default=str(SOUNDS_DIR), help="Папка со звуками")
-    parser.add_argument("--output", help="Выходной файл (по умолчанию: input_gachi_remix.mp3)")
-    parser.add_argument("--model", default="small", choices=["tiny", "base", "small", "medium", "large"],
-                        help="Модель Whisper (def: small)")
-    parser.add_argument("--lang", help="Язык для распознавания (по умолчанию авто)")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="Устройство (def: cpu)")
-    parser.add_argument("--api-key", help="API ключ Gemini (включает AI-матчинг)")
-    parser.add_argument("--volume", type=float, default=100, help="Громкость вставок в процентах (def: 100)")
-    parser.add_argument("--random-chance", type=float, default=0.2, help="Шанс случайной вставки 0-1 (def: 0.2)")
-    parser.add_argument("--no-rules", action="store_true", help="Отключить rules-based матчинг, только AI")
-    args = parser.parse_args()
+def mix(original_path: str | Path, placements: list[Placement],
+        output_path: str | Path, volume_pct: float) -> None:
+    dur = get_duration(original_path)
+    dur_ms = int(dur * 1000) if dur > 0 else 999_999_999
+
+    delay_inputs: list[str] = []
+    filters: list[str] = []
+    valid: list[Placement] = []
+    vol = max(0.01, volume_pct / 100)
+
+    for i, p in enumerate(placements):
+        spath = p.sound
+        if not os.path.isfile(spath):
+            log.warning("  Missing sound: %s", spath)
+            continue
+        delay_ms = int(p.start * 1000)
+        if delay_ms > dur_ms or delay_ms < 0:
+            continue
+        valid.append(p)
+        label = f"s{i}"
+        delay_inputs.extend(["-i", spath])
+        filters.append(f"[{i+1}:a]volume={vol}[a{i}];")
+        filters.append(f"[a{i}]adelay={delay_ms}|{delay_ms}[{label}];")
+
+    if not valid:
+        log.warning("No valid sounds — copying original")
+        shutil.copy2(str(original_path), str(output_path))
+        return
+
+    mix_inputs = "[0:a]" + "".join(f"[s{j}]" for j in range(len(valid)))
+    filters.append(f"{mix_inputs}amix=inputs={len(valid)+1}:duration=first")
+
+    log.info("Mixing %d sounds via FFmpeg...", len(valid))
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(original_path),
+        *delay_inputs,
+        "-filter_complex", "".join(filters),
+        "-ac", "2", "-b:a", "192k",
+        str(output_path),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            for line in r.stderr.split("\n"):
+                if any(w in line.lower() for w in ["error", "invalid", "cannot"]):
+                    log.error("  FFmpeg: %s", line.strip()[:120])
+            log.warning("  FFmpeg failed — copying original")
+            shutil.copy2(str(original_path), str(output_path))
+        else:
+            log.info("Saved: %s", output_path)
+    except subprocess.TimeoutExpired:
+        log.error("FFmpeg timed out")
+        shutil.copy2(str(original_path), str(output_path))
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Gachi Remix — gachi-ремикс любой песни через AI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  %(prog)s track.mp3\n"
+            "  %(prog)s track.mp3 --api-key KEY --model medium\n"
+            "  %(prog)s track.mp3 --dry-run --save-placements plan.json\n"
+            "  %(prog)s batch/ --api-key KEY --output-dir remixes/\n"
+        ),
+    )
+    p.add_argument("input", help="Файл или папка с треками")
+    p.add_argument("--api-key", help="Gemini API key (AI-матчинг)")
+    p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
+                   help="Папка со звуками (def: ./sounds)")
+    p.add_argument("--output", "-o", help="Выходной файл")
+    p.add_argument("--output-dir", help="Папка для результатов (при batch)")
+    p.add_argument("--model", default="small",
+                   choices=["tiny", "base", "small", "medium", "large", "large-v3"],
+                   help="Модель whisper (def: small)")
+    p.add_argument("--lang", help="Язык (по умолчанию автоопределение)")
+    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--volume", type=float, default=85,
+                   help="Громкость вставок в %% (def: 85)")
+    p.add_argument("--random-chance", type=float, default=0.15,
+                   help="Шанс случайной вставки 0-1 (def: 0.15)")
+    p.add_argument("--min-pause", type=float, default=0.8,
+                   help="Мин. пауза для случайной вставки, сек (def: 0.8)")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="Не использовать rules-based, только AI")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Не создавать файл, только показать placements")
+    p.add_argument("--save-placements", help="Сохранить placements в JSON")
+    p.add_argument("--load-placements", help="Загрузить placements из JSON")
+    p.add_argument("--verbose", "-v", action="store_true", help="Подробные логи")
+    p.add_argument("--debug", action="store_true", help="Debug-логи")
+
+    args = p.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+    for noisy in ("httpx", "httpcore", "google", "huggingface_hub",
+                  "urllib3", "fsspec", "PIL", "ctranslate2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    check_ffmpeg()
+    library = SoundLibrary(args.sounds)
+    if not library.all_sounds:
+        log.error("No sounds found in %s", args.sounds)
+        sys.exit(1)
+    log.info("Sounds: %d files, %d keywords", len(library.all_sounds),
+             len(library.by_keyword))
+
     input_path = Path(args.input)
-    output_path = args.output or str(input_path.with_name(input_path.stem + "_gachi_remix.mp3"))
-    sound_map = build_sound_map(Path(args.sounds))
-    if not sound_map or not sound_map.get("_all"):
-        print(f"No sounds in {args.sounds}")
-        sys.exit(1)
-    print(f"Loaded {len(sound_map['_all'])} sounds, {len(sound_map)-1} keywords")
-    segments = transcribe(str(input_path), args.model, args.lang, args.device)
-    has_words = any(seg.get("words") for seg in segments)
-    placements = []
-    used_sounds = {}
-    if args.api_key and has_words:
-        print("Matching with Gemini AI...")
-        ai_p = match_with_gemini(segments, sound_map, args.api_key)
-        for p in ai_p:
-            placements.append(p)
-            f = p["sound"]
-            used_sounds[f] = used_sounds.get(f, 0) + 1
-        print(f"  AI: {len(ai_p)} placements")
-    if not args.no_rules and has_words:
-        rules_found = 0
+    files: list[Path] = []
+    if input_path.is_dir():
+        files = sorted(
+            f for f in input_path.iterdir()
+            if f.suffix.lower() in (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".mp4", ".mov", ".avi")
+        )
+        if not files:
+            log.error("No audio/video files in %s", input_path)
+            sys.exit(1)
+        log.info("Batch: %d files", len(files))
+    else:
+        files = [input_path]
+
+    for idx, fpath in enumerate(files, 1):
+        if len(files) > 1:
+            log.info("\n--- [%d/%d] %s ---", idx, len(files), fpath.name)
+
+        output_path = args.output
+        if not output_path:
+            if args.output_dir:
+                output_path = str(Path(args.output_dir) / fpath.stem) + "_gachi_remix.mp3"
+            else:
+                output_path = str(fpath.with_name(fpath.stem + "_gachi_remix.mp3"))
+
+        try:
+            _process_file(fpath, output_path, library, args)
+        except KeyboardInterrupt:
+            log.info("\nAborted")
+            sys.exit(130)
+        except Exception as exc:
+            log.error("Failed: %s", exc)
+            if args.debug:
+                import traceback; traceback.print_exc()
+
+
+def _process_file(input_path: Path, output_path: str,
+                  library: SoundLibrary, args: argparse.Namespace) -> None:
+    has_video = input_path.suffix.lower() in (".mp4", ".mov", ".avi")
+    audio_path = _extract_audio(input_path) if has_video else input_path
+
+    segments = transcribe(audio_path, args.model, args.lang, args.device)
+    has_words = any(seg.words for seg in segments)
+
+    placements: list[Placement] = []
+
+    # 1. Load pre-defined placements
+    if args.load_placements:
+        try:
+            with open(args.load_placements) as f:
+                data = json.load(f)
+            placements = [Placement(**item) for item in data]
+            log.info("Loaded %d placements from %s", len(placements),
+                     args.load_placements)
+        except Exception as exc:
+            log.error("Can't load placements: %s", exc)
+
+    used: dict[str, int] = {}
+
+    # 2. Gemini AI matching
+    if args.api_key and has_words and not args.load_placements:
+        log.info("🦾 Gemini matching...")
+        ai_placements = gemini_match(segments, library, args.api_key)
+        for pl in ai_placements:
+            placements.append(pl)
+            used[pl.sound] = used.get(pl.sound, 0) + 1
+        log.info("  Gemini: %d placements", len(ai_placements))
+
+    # 3. Rules-based fallback
+    if not args.no_fallback and has_words and not args.load_placements:
+        count = 0
         for seg in segments:
-            for w in seg.get("words", []):
-                match = match_rules(w["text"], sound_map, used_sounds)
+            for w in seg.words:
+                match = library.match_by_rules(w.text, used)
                 if match:
-                    placements.append({"start": w["start"], "sound": match})
-                    used_sounds[match] = used_sounds.get(match, 0) + 1
-                    rules_found += 1
-        if rules_found:
-            print(f"  Rules: {rules_found} placements")
-    if has_words and args.random_chance > 0:
-        pauses = find_pauses(segments)
-        n = 0
-        all_sounds = sound_map["_all"]
+                    placements.append(Placement(start=w.start, sound=match))
+                    used[match] = used.get(match, 0) + 1
+                    count += 1
+        if count:
+            log.info("  Rules:  %d placements", count)
+
+    # 4. Random on pauses
+    if args.random_chance > 0 and has_words and not args.load_placements:
+        pauses = find_pauses(segments, args.min_pause)
+        count = 0
         for p in pauses:
-            if p["duration"] > 1.0 and random.random() < args.random_chance:
-                placements.append({"start": p["start"], "sound": random.choice(all_sounds)})
-                n += 1
-        if n:
-            print(f"  Random: {n} placements")
-    if not placements and not has_words:
-        dur = get_audio_duration(str(input_path))
-        all_sounds = sound_map["_all"]
-        for t in range(0, int(dur), 3):
-            placements.append({"start": t, "sound": random.choice(all_sounds)})
-        print(f"  Random (instrumental): {len(placements)} placements")
+            if random.random() < args.random_chance:
+                placements.append(Placement(
+                    start=p["start"], sound=library.random(),
+                ))
+                count += 1
+        if count:
+            log.info("  Random: %d placements", count)
+
+    # 5. Fallback for instrumental / empty
+    if not placements and not has_words and not args.load_placements:
+        log.info("No vocals detected — evenly spaced random")
+        dur = get_duration(audio_path) or 30
+        for t in range(2, int(dur) - 1, 3):
+            placements.append(Placement(start=float(t), sound=library.random()))
+        log.info("  Random: %d placements", len(placements))
+
     if not placements:
-        print("No placements found!")
-        sys.exit(1)
-    print(f"Total: {len(placements)} sound placements")
-    ffmpeg_mix(str(input_path), placements, output_path, args.volume)
+        log.warning("No placements — copying original")
+        shutil.copy2(str(audio_path), output_path)
+        return
+
+    placements.sort(key=lambda x: x.start)
+
+    # 5b. Remove overlapping (same second)
+    deduped: list[Placement] = []
+    last = -99
+    for pl in placements:
+        t = int(pl.start)
+        if t != last:
+            deduped.append(pl)
+            last = t
+        elif len(deduped) >= 2 and deduped[-2].sound == pl.sound:
+            deduped.append(pl)
+            last = t
+    placements = deduped
+
+    log.info("Total: %d unique placements", len(placements))
+
+    for pl in placements[:8]:
+        log.info("  [%6.2f] %s", pl.start, Path(pl.sound).name)
+    if len(placements) > 8:
+        log.info("  ... and %d more", len(placements) - 8)
+
+    if args.save_placements:
+        with open(args.save_placements, "w", encoding="utf-8") as f:
+            json.dump([asdict(p) for p in placements], f, ensure_ascii=False, indent=2)
+        log.info("Placements saved: %s", args.save_placements)
+
+    if args.dry_run:
+        log.info("Dry-run: no file created")
+        return
+
+    # 6. Mix!
+    mix(audio_path if not has_video else input_path,
+        placements, output_path, args.volume)
+
+
+def _extract_audio(video_path: Path) -> Path:
+    tmp = Path(tempfile.mkdtemp()) / f"{video_path.stem}_audio.mp3"
+    log.info("Extracting audio from %s...", video_path.name)
+    subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-q:a", "0",
+                    "-map", "a", str(tmp)],
+                   capture_output=True, check=True, timeout=120)
+    return tmp
+
 
 if __name__ == "__main__":
     main()
