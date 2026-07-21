@@ -17,8 +17,9 @@ def build_all():
         print(f"\n=== Building {spec} ===")
         subprocess.run([sys.executable, "-m", "PyInstaller", str(ROOT / spec)], check=True, cwd=ROOT)
     
-    print("\n=== Building Setup.spec ===")
-    subprocess.run([sys.executable, "-m", "PyInstaller", str(ROOT / "Setup.spec")], check=True, cwd=ROOT)
+    for spec in ["Setup.spec", "GachiRemix.spec"]:
+        print(f"\n=== Building {spec} ===")
+        subprocess.run([sys.executable, "-m", "PyInstaller", str(ROOT / spec)], check=True, cwd=ROOT)
     
     print("\nDone! Files in dist/:")
     for f in sorted(DIST.iterdir()):
