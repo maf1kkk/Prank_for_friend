@@ -8,7 +8,9 @@ import keyboard, mouse, pystray
 from PIL import Image, ImageDraw
 
 if getattr(sys, 'frozen', False):
-    BASE_DIR = Path(sys.executable).parent
+    BASE_DIR = Path(sys._MEIPASS)
+    if not (BASE_DIR / "sounds").exists():
+        BASE_DIR = Path(sys.executable).parent
 else:
     BASE_DIR = Path(__file__).parent.parent
 SOUNDS_DIR = BASE_DIR / "sounds"
