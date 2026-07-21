@@ -1,0 +1,14 @@
+{
+    "app_name": "Audio Service",
+    "startup_name": "AudioService",
+    "hotkeys": ["space","ctrl","alt","shift","w","a","s","d","q","e","r","t","y","f","g","h","j","k","l","z","x","c","v","b","n","m","1","2","3","4","5","6","7","8","9","0"],
+    "mouse_buttons": ["left","right","middle","x1","x2"],
+    "volume": 100,
+    "cooldown_ms": 300,
+    "autostart": true,
+    "tray_icon": true,
+    "tray_tooltip": "Audio Service",
+    "exit_hotkey": "ctrl+alt+shift+f12",
+    "priority_keywords": ["aah","ahh","oh","yeah","fuck","cum","slap"],
+    "priority_weight": 3
+}
