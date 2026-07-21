@@ -1,6 +1,6 @@
 """
 Gachi Remix — автоматический gachi-ремикс любой песни.
-Основа: faster-whisper + Gemini AI + FFmpeg.
+Основа: faster-whisper + LLM (локальный/AI) + FFmpeg.
 """
 
 from __future__ import annotations
@@ -43,11 +43,6 @@ class Segment:
     end: float
     text: str
     words: list[Word] = field(default_factory=list)
-
-@dataclass
-class SoundEntry:
-    path: str
-    keywords: list[str]
 
 # ---------------------------------------------------------------------------
 # Sound library
@@ -122,7 +117,7 @@ def check_ffmpeg() -> None:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10)
     except FileNotFoundError:
-        log.error("FFmpeg not found. Install it: https://ffmpeg.org/download.html")
+        log.error("FFmpeg not found. Install: https://ffmpeg.org/download.html")
         sys.exit(1)
 
 # ---------------------------------------------------------------------------
@@ -162,10 +157,10 @@ def transcribe(audio_path: str | Path, model_name: str, language: str | None,
     return segments
 
 # ---------------------------------------------------------------------------
-# Gemini matcher
+# LLM matcher (generic OpenAI-compatible API)
 # ---------------------------------------------------------------------------
 
-GEMINI_SYSTEM = """You are a music remix engineer. Given song lyrics with timestamps,
+LLM_SYSTEM = """You are a music remix engineer. Given song lyrics with timestamps,
 suggest where to insert gachi sound effects for maximum comedic/rhythmic effect.
 
 Available sounds (keyword -> filename):
@@ -176,19 +171,12 @@ Rules:
 - Place the sound RIGHT BEFORE the relevant word (not on it)
 - 2-5 inserts per minute for natural feel
 - Prioritize: cum/fuck/yeah/ah/oh/slap sounds at lewd/excited moments
-- If the song has no vocals / is instrumental, suggest random placements evenly spaced
 - Be creative — think like a DJ making a mashup
 
 Return ONLY a JSON array of {{"start": <seconds>, "sound": "<filename>"}}.
 No markdown, no explanation."""
 
-def gemini_match(segments: list[Segment], library: SoundLibrary,
-                 api_key: str) -> list[Placement]:
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=api_key)
-
+def _build_llm_prompt(segments: list[Segment], library: SoundLibrary) -> str:
     sound_lines = sorted(set(
         f"{kw:12s} -> {Path(v).stem}"
         for kw, vals in library.by_keyword.items()
@@ -204,32 +192,71 @@ def gemini_match(segments: list[Segment], library: SoundLibrary,
         lyrics_lines = [f"[{seg.start:.2f}] {seg.text}" for seg in segments]
     lyrics = "\n".join(lyrics_lines)
 
-    full_prompt = GEMINI_SYSTEM.format(sound_list=sound_list)
-    full_prompt += f"\n\nLyrics:\n{lyrics}"
+    prompt = LLM_SYSTEM.format(sound_list=sound_list)
+    prompt += f"\n\nLyrics:\n{lyrics}"
+    return prompt
+
+def _parse_llm_response(text: str, library: SoundLibrary) -> list[Placement]:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    data = json.loads(text)
+    placements = []
+    for item in data:
+        spath = library.lookup(item.get("sound", ""))
+        if spath:
+            placements.append(Placement(
+                start=float(item["start"]), sound=spath,
+            ))
+    return placements
+
+
+def llm_match_openai(segments: list[Segment], library: SoundLibrary,
+                     api_url: str, model: str, api_key: str = "ollama") -> list[Placement]:
+    from openai import OpenAI
+
+    client = OpenAI(base_url=api_url, api_key=api_key)
+    prompt = _build_llm_prompt(segments, library)
+
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a precise JSON generator."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                max_tokens=4096,
+            )
+            text = resp.choices[0].message.content or ""
+            return _parse_llm_response(text, library)
+        except json.JSONDecodeError:
+            log.warning("  LLM: malformed JSON (attempt %d)", attempt + 1)
+        except Exception as exc:
+            log.warning("  LLM: %s (attempt %d)", exc, attempt + 1)
+        time.sleep(1)
+    return []
+
+
+def llm_match_gemini(segments: list[Segment], library: SoundLibrary,
+                     api_key: str) -> list[Placement]:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    prompt = _build_llm_prompt(segments, library)
 
     for attempt in range(3):
         try:
             resp = client.models.generate_content(
                 model="gemini-2.0-flash",
-                contents=full_prompt,
+                contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=4096,
+                    temperature=0.7, max_output_tokens=4096,
                 ),
             )
-            text = resp.text.strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-            data = json.loads(text)
-            placements = []
-            for item in data:
-                spath = library.lookup(item.get("sound", ""))
-                if spath:
-                    placements.append(Placement(
-                        start=float(item["start"]),
-                        sound=spath,
-                    ))
-            return placements
+            return _parse_llm_response(resp.text, library)
         except json.JSONDecodeError:
             log.warning("  Gemini: malformed JSON (attempt %d)", attempt + 1)
         except Exception as exc:
@@ -321,13 +348,26 @@ def main() -> None:
         epilog=(
             "Примеры:\n"
             "  %(prog)s track.mp3\n"
-            "  %(prog)s track.mp3 --api-key KEY --model medium\n"
+            "  %(prog)s track.mp3 --backend ollama --llm-model qwen2.5:7b\n"
+            "  %(prog)s track.mp3 --backend gemini --api-key KEY\n"
             "  %(prog)s track.mp3 --dry-run --save-placements plan.json\n"
-            "  %(prog)s batch/ --api-key KEY --output-dir remixes/\n"
+            "  %(prog)s папка/ --output-dir remixes/\n"
+            "\n"
+            "Установка Ollama (бесплатно, без ключей):\n"
+            "  1. https://ollama.com/download\n"
+            "  2. ollama pull qwen2.5:7b  (или llama3.2:3b для слабых ПК)\n"
+            "  3. Запустите скрипт с --backend ollama\n"
         ),
     )
     p.add_argument("input", help="Файл или папка с треками")
-    p.add_argument("--api-key", help="Gemini API key (AI-матчинг)")
+    p.add_argument("--backend", default="ollama",
+                   choices=["ollama", "openai", "gemini", "none"],
+                   help="Бэкенд для AI (def: ollama — локальный, без ключей)")
+    p.add_argument("--api-key", help="API ключ (для gemini/openai)")
+    p.add_argument("--llm-url", default="http://localhost:11434/v1",
+                   help="URL для OpenAI-совместимого API (def: http://localhost:11434/v1)")
+    p.add_argument("--llm-model", default="qwen2.5:7b",
+                   help="Модель LLM (def: qwen2.5:7b)")
     p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
                    help="Папка со звуками (def: ./sounds)")
     p.add_argument("--output", "-o", help="Выходной файл")
@@ -359,7 +399,7 @@ def main() -> None:
     elif args.verbose:
         logging.getLogger().setLevel(logging.INFO)
     for noisy in ("httpx", "httpcore", "google", "huggingface_hub",
-                  "urllib3", "fsspec", "PIL", "ctranslate2"):
+                  "urllib3", "fsspec", "PIL", "ctranslate2", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     check_ffmpeg()
@@ -391,7 +431,9 @@ def main() -> None:
         output_path = args.output
         if not output_path:
             if args.output_dir:
-                output_path = str(Path(args.output_dir) / fpath.stem) + "_gachi_remix.mp3"
+                outdir = Path(args.output_dir)
+                outdir.mkdir(parents=True, exist_ok=True)
+                output_path = str(outdir / f"{fpath.stem}_gachi_remix.mp3")
             else:
                 output_path = str(fpath.with_name(fpath.stem + "_gachi_remix.mp3"))
 
@@ -415,6 +457,7 @@ def _process_file(input_path: Path, output_path: str,
     has_words = any(seg.words for seg in segments)
 
     placements: list[Placement] = []
+    used: dict[str, int] = {}
 
     # 1. Load pre-defined placements
     if args.load_placements:
@@ -427,18 +470,40 @@ def _process_file(input_path: Path, output_path: str,
         except Exception as exc:
             log.error("Can't load placements: %s", exc)
 
-    used: dict[str, int] = {}
+    # 2. LLM / AI matching
+    if not args.load_placements and has_words:
+        if args.backend == "gemini":
+            if not args.api_key:
+                log.warning("--backend gemini requires --api-key")
+            else:
+                log.info("Gemini matching...")
+                ai_p = llm_match_gemini(segments, library, args.api_key)
+                for pl in ai_p:
+                    placements.append(pl)
+                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                log.info("  Gemini: %d placements", len(ai_p))
+        elif args.backend == "ollama":
+            log.info("Ollama matching (%s)...", args.llm_model)
+            ai_p = llm_match_openai(segments, library, args.llm_url,
+                                    args.llm_model)
+            for pl in ai_p:
+                placements.append(pl)
+                used[pl.sound] = used.get(pl.sound, 0) + 1
+            log.info("  Ollama: %d placements", len(ai_p))
+        elif args.backend == "openai":
+            log.info("OpenAI matching (%s)...", args.llm_model)
+            key = args.api_key or os.environ.get("OPENAI_API_KEY", "")
+            if not key:
+                log.warning("OPENAI_API_KEY not set")
+            else:
+                ai_p = llm_match_openai(segments, library, args.llm_url,
+                                        args.llm_model, key)
+                for pl in ai_p:
+                    placements.append(pl)
+                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                log.info("  OpenAI: %d placements", len(ai_p))
 
-    # 2. Gemini AI matching
-    if args.api_key and has_words and not args.load_placements:
-        log.info("🦾 Gemini matching...")
-        ai_placements = gemini_match(segments, library, args.api_key)
-        for pl in ai_placements:
-            placements.append(pl)
-            used[pl.sound] = used.get(pl.sound, 0) + 1
-        log.info("  Gemini: %d placements", len(ai_placements))
-
-    # 3. Rules-based fallback
+    # 3. Rules-based fallback (when AI fails or disabled)
     if not args.no_fallback and has_words and not args.load_placements:
         count = 0
         for seg in segments:
@@ -466,7 +531,7 @@ def _process_file(input_path: Path, output_path: str,
 
     # 5. Fallback for instrumental / empty
     if not placements and not has_words and not args.load_placements:
-        log.info("No vocals detected — evenly spaced random")
+        log.info("No vocals — evenly spaced random")
         dur = get_duration(audio_path) or 30
         for t in range(2, int(dur) - 1, 3):
             placements.append(Placement(start=float(t), sound=library.random()))
@@ -479,7 +544,7 @@ def _process_file(input_path: Path, output_path: str,
 
     placements.sort(key=lambda x: x.start)
 
-    # 5b. Remove overlapping (same second)
+    # Deduplicate (same second)
     deduped: list[Placement] = []
     last = -99
     for pl in placements:
@@ -493,7 +558,6 @@ def _process_file(input_path: Path, output_path: str,
     placements = deduped
 
     log.info("Total: %d unique placements", len(placements))
-
     for pl in placements[:8]:
         log.info("  [%6.2f] %s", pl.start, Path(pl.sound).name)
     if len(placements) > 8:
@@ -501,14 +565,14 @@ def _process_file(input_path: Path, output_path: str,
 
     if args.save_placements:
         with open(args.save_placements, "w", encoding="utf-8") as f:
-            json.dump([asdict(p) for p in placements], f, ensure_ascii=False, indent=2)
+            json.dump([asdict(p) for p in placements], f,
+                      ensure_ascii=False, indent=2)
         log.info("Placements saved: %s", args.save_placements)
 
     if args.dry_run:
         log.info("Dry-run: no file created")
         return
 
-    # 6. Mix!
     mix(audio_path if not has_video else input_path,
         placements, output_path, args.volume)
 
