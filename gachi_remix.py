@@ -19,6 +19,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+VERSION = "1.0.0"
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("gachi_remix")
 
@@ -43,6 +45,11 @@ class Segment:
     end: float
     text: str
     words: list[Word] = field(default_factory=list)
+
+@dataclass
+class Pause:
+    start: float
+    end: float
 
 # ---------------------------------------------------------------------------
 # Sound library
@@ -119,6 +126,10 @@ def check_ffmpeg() -> None:
     except FileNotFoundError:
         log.error("FFmpeg not found. Install: https://ffmpeg.org/download.html")
         sys.exit(1)
+
+SUPPORTED_AUDIO = (".mp3", ".wav", ".ogg", ".flac", ".m4a")
+SUPPORTED_VIDEO = (".mp4", ".mov", ".avi")
+SUPPORTED_EXT = SUPPORTED_AUDIO + SUPPORTED_VIDEO
 
 # ---------------------------------------------------------------------------
 # Transcription
@@ -286,17 +297,51 @@ def llm_match_gemini(segments: list[Segment], library: SoundLibrary,
     return []
 
 # ---------------------------------------------------------------------------
-# Rules matcher
+# Matchers composition
 # ---------------------------------------------------------------------------
 
-def find_pauses(segments: list[Segment], min_gap: float = 0.5) -> list[dict]:
+def find_pauses(segments: list[Segment], min_gap: float = 0.5) -> list[Pause]:
     words = [w for seg in segments for w in seg.words]
     pauses = []
     for i in range(len(words) - 1):
         gap = words[i + 1].start - words[i].end
         if gap >= min_gap:
-            pauses.append({"start": words[i].end, "end": words[i + 1].start})
+            pauses.append(Pause(start=words[i].end, end=words[i + 1].start))
     return pauses
+
+def deduplicate(placements: list[Placement]) -> list[Placement]:
+    if not placements:
+        return []
+    placements.sort(key=lambda x: x.start)
+    result = [placements[0]]
+    for pl in placements[1:]:
+        prev = result[-1]
+        gap = pl.start - prev.start
+        if gap >= 0.5 or pl.sound != prev.sound:
+            result.append(pl)
+    return result
+
+# ---------------------------------------------------------------------------
+# Cost helpers
+# ---------------------------------------------------------------------------
+
+BACKEND_CONFIG = {
+    "deepseek": {"url": "https://api.deepseek.com/v1",  "model": "deepseek-chat", "cost": (0.0002, 0.0004)},
+    "ollama":   {"url": "http://localhost:11434/v1",     "model": "qwen2.5:7b",   "cost": (0, 0)},
+    "gemini":   {"url": "",                               "model": "gemini-2.0-flash", "cost": (0, 0)},
+    "openai":   {"url": "https://api.openai.com/v1",     "model": "gpt-4o-mini",  "cost": (0.0015, 0.0060)},
+    "none":     {"url": "",                               "model": "",             "cost": (0, 0)},
+}
+
+def estimate_cost(backend: str, duration_sec: float) -> str:
+    cfg = BACKEND_CONFIG.get(backend, {})
+    rate_in, rate_out = cfg.get("cost", (0, 0))
+    est_in = int(duration_sec * 2) + 200
+    est_out = 300
+    cost = (est_in / 1000 * rate_in) + (est_out / 1000 * rate_out)
+    if cost == 0:
+        return "0 (free)"
+    return f"~${cost:.4f} (~{cost * 100:.2f} cents)"
 
 # ---------------------------------------------------------------------------
 # FFmpeg mixer
@@ -310,7 +355,7 @@ def mix(original_path: str | Path, placements: list[Placement],
     delay_inputs: list[str] = []
     filters: list[str] = []
     valid: list[Placement] = []
-    vol = max(0.01, volume_pct / 100)
+    vol = min(1.0, max(0.01, volume_pct / 100))
 
     for i, p in enumerate(placements):
         spath = p.sound
@@ -335,6 +380,7 @@ def mix(original_path: str | Path, placements: list[Placement],
     filters.append(f"{mix_inputs}amix=inputs={len(valid)+1}:duration=first")
 
     log.info("Mixing %d sounds via FFmpeg...", len(valid))
+    timeout = max(60, int(dur * 1.5))
     cmd = [
         "ffmpeg", "-y",
         "-i", str(original_path),
@@ -344,7 +390,7 @@ def mix(original_path: str | Path, placements: list[Placement],
         str(output_path),
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             for line in r.stderr.split("\n"):
                 if any(w in line.lower() for w in ["error", "invalid", "cannot"]):
@@ -354,161 +400,102 @@ def mix(original_path: str | Path, placements: list[Placement],
         else:
             log.info("Saved: %s", output_path)
     except subprocess.TimeoutExpired:
-        log.error("FFmpeg timed out")
+        log.error("FFmpeg timed out (%ds)", timeout)
         shutil.copy2(str(original_path), str(output_path))
 
 # ---------------------------------------------------------------------------
-# Cost helpers
+# Video extraction (with cleanup)
 # ---------------------------------------------------------------------------
 
-def estimate_cost(backend: str, duration_sec: float) -> str:
-    estimates = {
-        "deepseek":  (0.0002, 0.0004),  # $ per 1k tokens in/out
-        "gemini":    (0.000,  0.000),    # free tier
-        "ollama":    (0, 0),
-        "openai":    (0.0015, 0.0060),   # gpt-4o-mini
-    }
-    rate_in, rate_out = estimates.get(backend, (0, 0))
-    est_in = int(duration_sec * 2) + 200  # ~200-800 tokens
-    est_out = 300
-    cost = (est_in / 1000 * rate_in) + (est_out / 1000 * rate_out)
-    if cost == 0:
-        return "0 (free)"
-    return f"~${cost:.4f} (~{cost * 100:.2f} cents)"
+_temp_dirs: list[Path] = []
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _extract_audio(video_path: Path) -> Path:
+    tmpdir = Path(tempfile.mkdtemp(prefix="gachi_"))
+    _temp_dirs.append(tmpdir)
+    out = tmpdir / f"{video_path.stem}_audio.mp3"
+    log.info("Extracting audio from %s...", video_path.name)
+    subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-q:a", "0",
+                    "-map", "a", str(out)],
+                   capture_output=True, check=True, timeout=120)
+    return out
 
-def main() -> None:
-    import argparse
-    p = argparse.ArgumentParser(
-        description="Gachi Remix — gachi-ремикс любой песни через AI",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Примеры:\n"
-            "  %(prog)s track.mp3\n"
-            "  %(prog)s track.mp3 --backend ollama\n"
-            "  %(prog)s track.mp3 --backend deepseek --api-key sk-...\n"
-            "  %(prog)s track.mp3 --backend gemini --api-key KEY\n"
-            "  %(prog)s track.mp3 --dry-run --save-placements plan.json\n"
-            "  %(prog)s папка/ --output-dir remixes/\n"
-            "\n"
-            "Установка Ollama (бесплатно, без ключей):\n"
-            "  1. https://ollama.com/download\n"
-            "  2. ollama pull qwen2.5:7b  (или llama3.2:3b для слабых ПК)\n"
-            "  3. Запустите скрипт с --backend ollama\n"
-        ),
-    )
-    p.add_argument("input", help="Файл или папка с треками")
-    p.add_argument("--backend", default="ollama",
-                   choices=["ollama", "deepseek", "openai", "gemini", "none"],
-                   help="Бэкенд для AI (def: ollama — локальный, без ключей)")
-    p.add_argument("--api-key", help="API ключ (для gemini/openai/deepseek)")
-    p.add_argument("--llm-url", default="http://localhost:11434/v1",
-                   help="URL для OpenAI-совместимого API (def: http://localhost:11434/v1)")
-    p.add_argument("--llm-model",
-                   help="Модель LLM (def: qwen2.5:7b для ollama, deepseek-chat для deepseek)")
-    p.add_argument("--max-placements", type=int, default=15,
-                   help="Максимум вставок от AI (def: 15)")
-    p.add_argument("--max-files", type=int, default=5,
-                   help="Максимум файлов при batch-обработке (def: 5)")
-    p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
-                   help="Папка со звуками (def: ./sounds)")
-    p.add_argument("--output", "-o", help="Выходной файл")
-    p.add_argument("--output-dir", help="Папка для результатов (при batch)")
-    p.add_argument("--model", default="small",
-                   choices=["tiny", "base", "small", "medium", "large", "large-v3"],
-                   help="Модель whisper (def: small)")
-    p.add_argument("--lang", help="Язык (по умолчанию автоопределение)")
-    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    p.add_argument("--volume", type=float, default=85,
-                   help="Громкость вставок в %% (def: 85)")
-    p.add_argument("--random-chance", type=float, default=0.15,
-                   help="Шанс случайной вставки 0-1 (def: 0.15)")
-    p.add_argument("--min-pause", type=float, default=0.8,
-                   help="Мин. пауза для случайной вставки, сек (def: 0.8)")
-    p.add_argument("--no-fallback", action="store_true",
-                   help="Не использовать rules-based, только AI")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Не создавать файл, только показать placements")
-    p.add_argument("--save-placements", help="Сохранить placements в JSON")
-    p.add_argument("--load-placements", help="Загрузить placements из JSON")
-    p.add_argument("--yes", "-y", action="store_true",
-                   help="Автоматически подтверждать batch-обработку")
-    p.add_argument("--verbose", "-v", action="store_true", help="Подробные логи")
-    p.add_argument("--debug", action="store_true", help="Debug-логи")
-
-    args = p.parse_args()
-
-    if not args.llm_model:
-        args.llm_model = "deepseek-chat" if args.backend == "deepseek" else "qwen2.5:7b"
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    elif args.verbose:
-        logging.getLogger().setLevel(logging.INFO)
-    for noisy in ("httpx", "httpcore", "google", "huggingface_hub",
-                  "urllib3", "fsspec", "PIL", "ctranslate2", "openai"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    check_ffmpeg()
-    library = SoundLibrary(args.sounds)
-    if not library.all_sounds:
-        log.error("No sounds found in %s", args.sounds)
-        sys.exit(1)
-    log.info("Sounds: %d files, %d keywords", len(library.all_sounds),
-             len(library.by_keyword))
-
-    input_path = Path(args.input)
-    files: list[Path] = []
-    if input_path.is_dir():
-        files = sorted(
-            f for f in input_path.iterdir()
-            if f.suffix.lower() in (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".mp4", ".mov", ".avi")
-        )
-        if not files:
-            log.error("No audio/video files in %s", input_path)
-            sys.exit(1)
-        if len(files) > args.max_files and not args.yes:
-            ans = input(f"  {len(files)} files found. Max {args.max_files}. Continue? [y/N] ")
-            if ans.lower() != "y":
-                log.info("Aborted")
-                sys.exit(0)
-            files = files[:args.max_files]
-        elif len(files) > args.max_files:
-            files = files[:args.max_files]
-        log.info("Batch: %d files", len(files))
-    else:
-        files = [input_path]
-
-    for idx, fpath in enumerate(files, 1):
-        if len(files) > 1:
-            log.info("\n--- [%d/%d] %s ---", idx, len(files), fpath.name)
-
-        output_path = args.output
-        if not output_path:
-            if args.output_dir:
-                outdir = Path(args.output_dir)
-                outdir.mkdir(parents=True, exist_ok=True)
-                output_path = str(outdir / f"{fpath.stem}_gachi_remix.mp3")
-            else:
-                output_path = str(fpath.with_name(fpath.stem + "_gachi_remix.mp3"))
-
+def cleanup_temp():
+    for d in _temp_dirs:
         try:
-            _process_file(fpath, output_path, library, args)
-        except KeyboardInterrupt:
-            log.info("\nAborted")
-            sys.exit(130)
-        except Exception as exc:
-            log.error("Failed: %s", exc)
-            if args.debug:
-                import traceback; traceback.print_exc()
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------------------
+# Process pipeline
+# ---------------------------------------------------------------------------
+
+def _run_ai_match(backend: str, segments: list[Segment], library: SoundLibrary,
+                  api_key: str | None, llm_url: str, llm_model: str,
+                  max_placements: int) -> list[Placement]:
+    mp = min(max_placements, 30)
+    if backend == "gemini":
+        if not api_key:
+            log.warning("--backend gemini requires --api-key")
+            return []
+        log.info("Gemini matching...")
+        return llm_match_gemini(segments, library, api_key, mp)
+    elif backend == "deepseek":
+        key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        if not key:
+            log.warning("--backend deepseek requires --api-key")
+            return []
+        log.info("DeepSeek matching (%s)...", llm_model)
+        return llm_match_openai(segments, library,
+                                "https://api.deepseek.com/v1", llm_model, key, mp)
+    elif backend == "ollama":
+        log.info("Ollama matching (%s)...", llm_model)
+        return llm_match_openai(segments, library, llm_url, llm_model,
+                                max_placements=mp)
+    elif backend == "openai":
+        key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not key:
+            log.warning("OPENAI_API_KEY not set")
+            return []
+        log.info("OpenAI matching (%s)...", llm_model)
+        return llm_match_openai(segments, library, llm_url, llm_model, key, mp)
+    return []
 
 
-def _process_file(input_path: Path, output_path: str,
-                  library: SoundLibrary, args: argparse.Namespace) -> None:
-    has_video = input_path.suffix.lower() in (".mp4", ".mov", ".avi")
+def _run_rules_match(segments: list[Segment], library: SoundLibrary) -> list[Placement]:
+    used: dict[str, int] = {}
+    result = []
+    for seg in segments:
+        for w in seg.words:
+            match = library.match_by_rules(w.text, used)
+            if match:
+                result.append(Placement(start=w.start, sound=match))
+                used[match] = used.get(match, 0) + 1
+    return result
+
+
+def _run_random_match(segments: list[Segment], library: SoundLibrary,
+                      chance: float, min_gap: float) -> list[Placement]:
+    pauses = find_pauses(segments, min_gap)
+    result = []
+    for p in pauses:
+        if random.random() < chance:
+            result.append(Placement(start=p.start, sound=library.random()))
+    return result
+
+
+def _instrumental_fallback(audio_path: Path, library: SoundLibrary) -> list[Placement]:
+    dur = get_duration(audio_path) or 30
+    result = []
+    for t in range(2, int(dur) - 1, 3):
+        result.append(Placement(start=float(t), sound=library.random()))
+    return result
+
+
+def process_file(input_path: Path, output_path: str, library: SoundLibrary,
+                 args: argparse.Namespace) -> None:
+    import argparse
+    has_video = input_path.suffix.lower() in SUPPORTED_VIDEO
     audio_path = _extract_audio(input_path) if has_video else input_path
 
     segments = transcribe(audio_path, args.model, args.lang, args.device)
@@ -516,11 +503,9 @@ def _process_file(input_path: Path, output_path: str,
 
     if has_words and args.backend != "none" and not args.load_placements:
         dur = get_duration(audio_path)
-        cost_str = estimate_cost(args.backend, dur)
-        log.info("  ~Cost: %s", cost_str)
+        log.info("  ~Cost: %s", estimate_cost(args.backend, dur))
 
     placements: list[Placement] = []
-    used: dict[str, int] = {}
 
     # 1. Load pre-defined placements
     if args.load_placements:
@@ -528,105 +513,46 @@ def _process_file(input_path: Path, output_path: str,
             with open(args.load_placements) as f:
                 data = json.load(f)
             placements = [Placement(**item) for item in data]
-            log.info("Loaded %d placements from %s", len(placements),
-                     args.load_placements)
+            log.info("Loaded %d placements", len(placements))
         except Exception as exc:
             log.error("Can't load placements: %s", exc)
 
-    # 2. LLM / AI matching
-    if not args.load_placements and has_words:
-        mp = min(args.max_placements, 30)
-        if args.backend == "gemini":
-            if not args.api_key:
-                log.warning("--backend gemini requires --api-key")
-            else:
-                log.info("Gemini matching...")
-                ai_p = llm_match_gemini(segments, library, args.api_key, mp)
-                _add_placements(ai_p, placements, used)
-                log.info("  Gemini: %d placements", len(ai_p))
-        elif args.backend == "deepseek":
-            key = args.api_key or os.environ.get("DEEPSEEK_API_KEY", "")
-            if not key:
-                log.warning("--backend deepseek requires --api-key")
-            else:
-                log.info("DeepSeek matching (%s)...", args.llm_model)
-                ai_p = llm_match_openai(segments, library,
-                                        "https://api.deepseek.com/v1",
-                                        args.llm_model, key, mp)
-                _add_placements(ai_p, placements, used)
-                log.info("  DeepSeek: %d placements", len(ai_p))
-        elif args.backend == "ollama":
-            log.info("Ollama matching (%s)...", args.llm_model)
-            ai_p = llm_match_openai(segments, library, args.llm_url,
-                                    args.llm_model, max_placements=mp)
-            _add_placements(ai_p, placements, used)
-            log.info("  Ollama: %d placements", len(ai_p))
-        elif args.backend == "openai":
-            log.info("OpenAI matching (%s)...", args.llm_model)
-            key = args.api_key or os.environ.get("OPENAI_API_KEY", "")
-            if not key:
-                log.warning("OPENAI_API_KEY not set")
-            else:
-                ai_p = llm_match_openai(segments, library, args.llm_url,
-                                        args.llm_model, key, mp)
-                _add_placements(ai_p, placements, used)
-                log.info("  OpenAI: %d placements", len(ai_p))
+    # 2. AI matching
+    if not args.load_placements and has_words and args.backend != "none":
+        ai_p = _run_ai_match(args.backend, segments, library,
+                             args.api_key, args.llm_url, args.llm_model,
+                             args.max_placements)
+        placements.extend(ai_p)
+        if ai_p:
+            log.info("  %s: %d placements", args.backend.capitalize(), len(ai_p))
 
-    # 3. Rules-based fallback (when AI fails or disabled)
+    # 3. Rules-based
     if not args.no_fallback and has_words and not args.load_placements:
-        count = 0
-        for seg in segments:
-            for w in seg.words:
-                match = library.match_by_rules(w.text, used)
-                if match:
-                    placements.append(Placement(start=w.start, sound=match))
-                    used[match] = used.get(match, 0) + 1
-                    count += 1
-        if count:
-            log.info("  Rules:  %d placements", count)
+        rules_p = _run_rules_match(segments, library)
+        placements.extend(rules_p)
+        if rules_p:
+            log.info("  Rules: %d placements", len(rules_p))
 
     # 4. Random on pauses
     if args.random_chance > 0 and has_words and not args.load_placements:
-        pauses = find_pauses(segments, args.min_pause)
-        count = 0
-        for p in pauses:
-            if random.random() < args.random_chance:
-                placements.append(Placement(
-                    start=p["start"], sound=library.random(),
-                ))
-                count += 1
-        if count:
-            log.info("  Random: %d placements", count)
+        rand_p = _run_random_match(segments, library, args.random_chance, args.min_pause)
+        placements.extend(rand_p)
+        if rand_p:
+            log.info("  Random: %d placements", len(rand_p))
 
-    # 5. Fallback for instrumental / empty
+    # 5. Instrumental fallback
     if not placements and not has_words and not args.load_placements:
-        log.info("No vocals — evenly spaced random")
-        dur = get_duration(audio_path) or 30
-        for t in range(2, int(dur) - 1, 3):
-            placements.append(Placement(start=float(t), sound=library.random()))
-        log.info("  Random: %d placements", len(placements))
+        placements = _instrumental_fallback(audio_path, library)
+        log.info("  Instrumental: %d placements", len(placements))
 
     if not placements:
         log.warning("No placements — copying original")
         shutil.copy2(str(audio_path), output_path)
         return
 
-    placements.sort(key=lambda x: x.start)
+    placements = deduplicate(placements)
 
-    # Deduplicate (same second)
-    deduped: list[Placement] = []
-    last = -99
-    for pl in placements:
-        t = int(pl.start)
-        if t != last:
-            deduped.append(pl)
-            last = t
-        elif len(deduped) >= 2 and deduped[-2].sound == pl.sound:
-            deduped.append(pl)
-            last = t
-    placements = deduped
-
-    log.info("Total: %d unique placements", len(placements))
+    log.info("Total: %d placements", len(placements))
     for pl in placements[:8]:
         log.info("  [%6.2f] %s", pl.start, Path(pl.sound).name)
     if len(placements) > 8:
@@ -646,20 +572,139 @@ def _process_file(input_path: Path, output_path: str,
         placements, output_path, args.volume)
 
 
-def _add_placements(ai_p: list[Placement], placements: list[Placement],
-                    used: dict[str, int]) -> None:
-    for pl in ai_p:
-        placements.append(pl)
-        used[pl.sound] = used.get(pl.sound, 0) + 1
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _setup_logging(debug: bool, verbose: bool) -> None:
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif verbose:
+        logging.getLogger().setLevel(logging.INFO)
+    for noisy in ("httpx", "httpcore", "google", "huggingface_hub",
+                  "urllib3", "fsspec", "PIL", "ctranslate2", "openai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _extract_audio(video_path: Path) -> Path:
-    tmp = Path(tempfile.mkdtemp()) / f"{video_path.stem}_audio.mp3"
-    log.info("Extracting audio from %s...", video_path.name)
-    subprocess.run(["ffmpeg", "-y", "-i", str(video_path), "-q:a", "0",
-                    "-map", "a", str(tmp)],
-                   capture_output=True, check=True, timeout=120)
-    return tmp
+def _collect_files(input_path: Path, max_files: int, yes: bool) -> list[Path]:
+    if not input_path.exists():
+        log.error("File not found: %s", input_path)
+        sys.exit(1)
+    if input_path.is_dir():
+        files = sorted(f for f in input_path.iterdir() if f.suffix.lower() in SUPPORTED_EXT)
+        if not files:
+            log.error("No audio/video files in %s", input_path)
+            sys.exit(1)
+        if len(files) > max_files and not yes:
+            ans = input(f"  {len(files)} files. Max {max_files}. Continue? [y/N] ")
+            if ans.lower() != "y":
+                log.info("Aborted")
+                sys.exit(0)
+        files = files[:max_files]
+        log.info("Batch: %d files", len(files))
+        return files
+    return [input_path]
+
+
+def _resolve_output(input_path: Path, output: str | None, output_dir: str | None) -> str:
+    if output:
+        return output
+    if output_dir:
+        outdir = Path(output_dir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        return str(outdir / f"{input_path.stem}_gachi_remix.mp3")
+    return str(input_path.with_name(input_path.stem + "_gachi_remix.mp3"))
+
+
+def main() -> None:
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Gachi Remix — gachi-ремикс любой песни через AI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Примеры:\n"
+            "  %(prog)s track.mp3\n"
+            "  %(prog)s track.mp3 --backend ollama\n"
+            "  %(prog)s track.mp3 --backend deepseek --api-key sk-...\n"
+            "  %(prog)s track.mp3 --backend gemini --api-key KEY\n"
+            "  %(prog)s track.mp3 --dry-run --save-placements plan.json\n"
+            "  %(prog)s папка/ --output-dir remixes/\n"
+            "\n"
+            "Установка Ollama:\n"
+            "  1. https://ollama.com/download\n"
+            "  2. ollama pull qwen2.5:7b\n"
+            "  3. Запустите с --backend ollama\n"
+        ),
+    )
+    p.add_argument("input", help="Файл или папка с треками")
+    p.add_argument("--version", "-V", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("--backend", default="ollama",
+                   choices=list(BACKEND_CONFIG),
+                   help="Бэкенд AI (def: ollama)")
+    p.add_argument("--api-key", help="API ключ (deepseek/gemini/openai)")
+    p.add_argument("--llm-url", default=BACKEND_CONFIG["ollama"]["url"],
+                   help="URL API (def: http://localhost:11434/v1)")
+    p.add_argument("--llm-model",
+                   help="Модель LLM (def: qwen2.5:7b / deepseek-chat)")
+    p.add_argument("--max-placements", type=int, default=15,
+                   help="Максимум вставок (def: 15)")
+    p.add_argument("--max-files", type=int, default=5,
+                   help="Максимум файлов при batch (def: 5)")
+    p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
+                   help="Папка со звуками")
+    p.add_argument("--output", "-o", help="Выходной файл")
+    p.add_argument("--output-dir", help="Папка для результатов (batch)")
+    p.add_argument("--model", default="small",
+                   choices=["tiny", "base", "small", "medium", "large", "large-v3"],
+                   help="Модель whisper (def: small)")
+    p.add_argument("--lang", help="Язык (авто по умолчанию)")
+    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--volume", type=float, default=85,
+                   help="Громкость вставок %% (def: 85)")
+    p.add_argument("--random-chance", type=float, default=0.15,
+                   help="Шанс случайных вставок 0-1 (def: 0.15)")
+    p.add_argument("--min-pause", type=float, default=0.8,
+                   help="Мин. пауза для случайных вставок (def: 0.8)")
+    p.add_argument("--no-fallback", action="store_true",
+                   help="Только AI, без правил")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Без создания файла")
+    p.add_argument("--save-placements", help="Сохранить placements в JSON")
+    p.add_argument("--load-placements", help="Загрузить placements из JSON")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Авто-подтверждение batch")
+    p.add_argument("--verbose", "-v", action="store_true", help="Подробнее")
+    p.add_argument("--debug", action="store_true", help="Debug логи")
+
+    args = p.parse_args()
+
+    if not args.llm_model:
+        args.llm_model = (BACKEND_CONFIG["deepseek"]["model"]
+                          if args.backend == "deepseek"
+                          else BACKEND_CONFIG.get(args.backend, {}).get("model", "qwen2.5:7b"))
+
+    _setup_logging(args.debug, args.verbose)
+    check_ffmpeg()
+
+    library = SoundLibrary(args.sounds)
+    if not library.all_sounds:
+        log.error("No sounds in %s", args.sounds)
+        sys.exit(1)
+    log.info("Sounds: %d files, %d keywords", len(library.all_sounds),
+             len(library.by_keyword))
+
+    files = _collect_files(Path(args.input), args.max_files, args.yes)
+
+    try:
+        for idx, fpath in enumerate(files, 1):
+            if len(files) > 1:
+                log.info("\n--- [%d/%d] %s ---", idx, len(files), fpath.name)
+            output_path = _resolve_output(fpath, args.output, args.output_dir)
+            process_file(fpath, output_path, library, args)
+    except KeyboardInterrupt:
+        log.info("\nAborted")
+    finally:
+        cleanup_temp()
 
 
 if __name__ == "__main__":

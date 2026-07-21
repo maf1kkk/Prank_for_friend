@@ -1,36 +1,30 @@
 """
-Gachi Remix GUI — Desktop-приложение для автоматического gachi-ремикса.
+Gachi Remix GUI — Desktop-приложение.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+
 from gachi_remix import (
-    SoundLibrary, Placement, check_ffmpeg,
-    transcribe, find_pauses,
-    llm_match_openai, llm_match_gemini,
-    mix,
+    VERSION, BACKEND_CONFIG, SoundLibrary, Placement,
+    check_ffmpeg, get_duration, estimate_cost,
+    transcribe, process_file,
 )
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
 log = logging.getLogger("gachi_remix_gui")
-
-BACKENDS = {
-    "deepseek": {"url": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
-    "ollama":   {"url": "http://localhost:11434/v1",   "model": "qwen2.5:7b"},
-    "gemini":   {"url": "",                             "model": "gemini-2.0-flash"},
-    "openai":   {"url": "https://api.openai.com/v1",    "model": "gpt-4o-mini"},
-    "none":     {"url": "",                             "model": ""},
-}
 
 
 class LogHandler(logging.Handler):
@@ -39,134 +33,153 @@ class LogHandler(logging.Handler):
         self.callback = callback
 
     def emit(self, record):
-        msg = self.format(record)
-        self.callback(msg)
+        self.callback(self.format(record))
 
 
 class GachiRemixGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-
-        self.title("Gachi Remix")
-        self.geometry("700x620")
-        self.minsize(600, 520)
-        self.iconbitmap(default="")  # можно добавить иконку
+        self.title(f"Gachi Remix v{VERSION}")
+        self.geometry("740x680")
+        self.minsize(640, 560)
 
         self.input_path: str | None = None
         self.output_path: str | None = None
         self._running = False
+        self._pause_slider = None
 
         self._build_ui()
-
-        # Логи в UI
-        handler = LogHandler(self._on_log)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logging.getLogger("gachi_remix").setLevel(logging.INFO)
-        logging.getLogger("gachi_remix").addHandler(handler)
-
-        # Проверка FFmpeg при старте
+        self._setup_logging()
         self.after(500, self._check_ffmpeg)
+
+        # Drag & drop
+        self.drop_target_register(self._tk_dnd_wrapper())
+        self._bind_dnd()
+
+    # ------------------------------------------------------------------
+    # Drag & drop wrapper (cross-platform)
+    # ------------------------------------------------------------------
+
+    def _tk_dnd_wrapper(self):
+        try:
+            import tkinterdnd2
+            return tkinterdnd2.TkinterDnD
+        except ImportError:
+            pass
+        return None
+
+    def _bind_dnd(self):
+        self.file_label.bind("<Enter>", lambda e: self.file_label.configure(fg_color=("gray70", "gray35")))
+        self.file_label.bind("<Leave>", lambda e: self.file_label.configure(fg_color=("gray80", "gray25")))
 
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # --- File selection ---
-        file_frame = ctk.CTkFrame(self)
-        file_frame.pack(fill="x", padx=12, pady=(12, 4))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
-        ctk.CTkLabel(file_frame, text="Входной файл:", font=("", 13)).pack(side="left", padx=(8, 8))
-        self.file_label = ctk.CTkLabel(file_frame, text="не выбран", fg_color=("gray80", "gray25"),
-                                        corner_radius=6, anchor="w", padx=8)
-        self.file_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ctk.CTkButton(file_frame, text="Обзор", width=80, command=self._browse_file).pack(side="left", padx=(0, 8))
+        # Header
+        header = ctk.CTkFrame(self, corner_radius=0, height=50)
+        header.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        header.grid_propagate(False)
+        ctk.CTkLabel(header, text="🎵  Gachi Remix", font=("", 18, "bold")).pack(side="left", padx=14)
 
-        # --- Backend ---
-        params = ctk.CTkFrame(self)
-        params.pack(fill="x", padx=12, pady=4)
+        # ─── File ───
+        f1 = ctk.CTkFrame(self)
+        f1.grid(row=1, column=0, sticky="ew", padx=12, pady=(10, 2))
 
-        ctk.CTkLabel(params, text="Бэкенд:", font=("", 13)).grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        ctk.CTkLabel(f1, text="Файл:", font=("", 13)).pack(side="left", padx=(8, 6))
+        self.file_label = ctk.CTkLabel(f1, text="Перетащите файл или нажмите Обзор",
+                                        fg_color=("gray80", "gray25"),
+                                        corner_radius=6, anchor="w", padx=10,
+                                        height=32, font=("", 12))
+        self.file_label.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(f1, text="📁 Обзор", width=80, command=self._browse_file).pack(side="left", padx=(0, 8))
+
+        # ─── Backend & Key ───
+        f2 = ctk.CTkFrame(self)
+        f2.grid(row=2, column=0, sticky="ew", padx=12, pady=2)
+
+        ctk.CTkLabel(f2, text="Бэкенд:", font=("", 13)).grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
         self.backend_var = ctk.StringVar(value="deepseek")
-        self.backend_menu = ctk.CTkOptionMenu(params, values=list(BACKENDS.keys()),
+        self.backend_menu = ctk.CTkOptionMenu(f2, values=list(BACKEND_CONFIG),
                                                 variable=self.backend_var,
-                                                command=self._on_backend_change, width=120)
-        self.backend_menu.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=4)
+                                                command=self._on_backend_change, width=110)
+        self.backend_menu.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=3)
 
-        ctk.CTkLabel(params, text="API ключ:", font=("", 13)).grid(row=0, column=2, sticky="w", padx=(4, 4), pady=4)
-        self.api_key_entry = ctk.CTkEntry(params, placeholder_text="sk-... (необязательно)", width=200, show="*")
-        self.api_key_entry.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=4)
+        ctk.CTkLabel(f2, text="API ключ:", font=("", 13)).grid(row=0, column=2, sticky="w", padx=(4, 4), pady=3)
+        self.key_entry = ctk.CTkEntry(f2, placeholder_text="sk-...", width=180, show="*")
+        self.key_entry.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=3)
 
-        # --- Model ---
-        ctk.CTkLabel(params, text="Модель LLM:", font=("", 13)).grid(row=1, column=0, sticky="w", padx=(8, 4), pady=4)
-        self.model_entry = ctk.CTkEntry(params, width=180)
-        self.model_entry.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=4)
+        ctk.CTkLabel(f2, text="Модель:", font=("", 13)).grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
+        self.model_entry = ctk.CTkEntry(f2, width=140)
+        self.model_entry.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=3)
         self._on_backend_change("deepseek")
 
-        ctk.CTkLabel(params, text="Модель Whisper:", font=("", 13)).grid(row=1, column=2, sticky="w", padx=(4, 4), pady=4)
+        ctk.CTkLabel(f2, text="Whisper:", font=("", 13)).grid(row=1, column=2, sticky="w", padx=(4, 4), pady=3)
         self.whisper_var = ctk.StringVar(value="small")
-        ctk.CTkOptionMenu(params, values=["tiny", "base", "small", "medium", "large"],
-                           variable=self.whisper_var, width=100).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=4)
+        ctk.CTkOptionMenu(f2, values=["tiny", "base", "small", "medium", "large"],
+                           variable=self.whisper_var, width=90).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=3)
+        f2.columnconfigure(3, weight=1)
 
-        params.columnconfigure(3, weight=1)
+        # ─── Sliders ───
+        f3 = ctk.CTkFrame(self)
+        f3.grid(row=3, column=0, sticky="ew", padx=12, pady=2)
 
-        # --- Sliders ---
-        sliders = ctk.CTkFrame(self)
-        sliders.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(f3, text="🔊").grid(row=0, column=0, padx=(8, 2))
+        self.vol_slider = ctk.CTkSlider(f3, from_=10, to=100, command=lambda v: self.vol_label.configure(text=f"{int(v)}%"))
+        self.vol_slider.set(85)
+        self.vol_slider.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        self.vol_label = ctk.CTkLabel(f3, text="85%", width=36)
+        self.vol_label.grid(row=0, column=2, padx=(0, 12))
 
-        ctk.CTkLabel(sliders, text="Громкость вставок:").grid(row=0, column=0, sticky="w", padx=(8, 4))
-        self.volume_slider = ctk.CTkSlider(sliders, from_=10, to=150, number_of_steps=28, command=self._on_volume)
-        self.volume_slider.set(85)
-        self.volume_slider.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        self.volume_label = ctk.CTkLabel(sliders, text="85%", width=40)
-        self.volume_label.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(f3, text="🎲").grid(row=0, column=3, padx=(4, 2))
+        self.rnd_slider = ctk.CTkSlider(f3, from_=0, to=50, number_of_steps=10,
+                                          command=lambda v: self.rnd_label.configure(text=f"{int(v)}%"))
+        self.rnd_slider.set(15)
+        self.rnd_slider.grid(row=0, column=4, sticky="ew", padx=(0, 4))
+        self.rnd_label = ctk.CTkLabel(f3, text="15%", width=36)
+        self.rnd_label.grid(row=0, column=5, padx=(0, 8))
+        f3.columnconfigure((1, 4), weight=1)
 
-        ctk.CTkLabel(sliders, text="Случайные вставки:").grid(row=1, column=0, sticky="w", padx=(8, 4))
-        self.random_slider = ctk.CTkSlider(sliders, from_=0, to=100, number_of_steps=20, command=self._on_random)
-        self.random_slider.set(15)
-        self.random_slider.grid(row=1, column=1, sticky="ew", padx=(0, 8))
-        self.random_label = ctk.CTkLabel(sliders, text="15%", width=40)
-        self.random_label.grid(row=1, column=2, sticky="w", padx=(0, 8))
-
-        sliders.columnconfigure(1, weight=1)
-
-        # --- Checkboxes ---
-        opts = ctk.CTkFrame(self)
-        opts.pack(fill="x", padx=12, pady=4)
+        # ─── Checkboxes ───
+        f4 = ctk.CTkFrame(self)
+        f4.grid(row=4, column=0, sticky="ew", padx=12, pady=2)
 
         self.no_fallback_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opts, text="Только AI (без правил)", variable=self.no_fallback_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f4, text="Только AI", variable=self.no_fallback_var).pack(side="left", padx=8)
         self.dry_run_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(opts, text="Dry-run (без файла)", variable=self.dry_run_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(f4, text="Dry-run", variable=self.dry_run_var).pack(side="left", padx=8)
 
-        # --- Generate button ---
-        self.gen_btn = ctk.CTkButton(self, text="🎵  Сгенерировать gachi-ремикс", height=42,
+        # ─── Generate ───
+        self.gen_btn = ctk.CTkButton(self, text="🎵  Сгенерировать", height=44,
                                       font=("", 15, "bold"), command=self._generate)
-        self.gen_btn.pack(fill="x", padx=12, pady=8)
+        self.gen_btn.grid(row=5, column=0, sticky="ew", padx=12, pady=(6, 0))
 
-        # --- Progress ---
         self.progress = ctk.CTkProgressBar(self, mode="determinate")
-        self.progress.pack(fill="x", padx=12, pady=(0, 4))
+        self.progress.grid(row=6, column=0, sticky="ew", padx=12, pady=(4, 0))
         self.progress.set(0)
 
-        # --- Log ---
-        log_frame = ctk.CTkFrame(self)
-        log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        self.status_label = ctk.CTkLabel(self, text="", font=("", 11), anchor="w")
+        self.status_label.grid(row=7, column=0, sticky="ew", padx=14, pady=(0, 2))
 
-        self.log_text = ctk.CTkTextbox(log_frame, state="disabled", font=("Consolas", 11))
-        self.log_text.pack(fill="both", expand=True)
+        # ─── Log ───
+        self.log_text = ctk.CTkTextbox(self, state="disabled", font=("Consolas", 11), height=120)
+        self.log_text.grid(row=8, column=0, sticky="nsew", padx=12, pady=(2, 2))
 
-        # --- Output ---
-        out_frame = ctk.CTkFrame(self)
-        out_frame.pack(fill="x", padx=12, pady=(0, 12))
+        # ─── Output ───
+        f5 = ctk.CTkFrame(self)
+        f5.grid(row=9, column=0, sticky="ew", padx=12, pady=(0, 10))
 
-        ctk.CTkLabel(out_frame, text="Результат:", font=("", 13)).pack(side="left", padx=(8, 4))
-        self.out_label = ctk.CTkLabel(out_frame, text="—", fg_color=("gray80", "gray25"),
+        ctk.CTkLabel(f5, text="Готово:", font=("", 13)).pack(side="left", padx=(8, 4))
+        self.out_label = ctk.CTkLabel(f5, text="—", fg_color=("gray80", "gray25"),
                                        corner_radius=6, anchor="w", padx=8)
         self.out_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.play_btn = ctk.CTkButton(out_frame, text="▶ Играть", width=80, state="disabled", command=self._play)
-        self.play_btn.pack(side="left", padx=(0, 4))
-        self.open_btn = ctk.CTkButton(out_frame, text="📂 Папка", width=80, state="disabled", command=self._open_folder)
+        self.play_btn = ctk.CTkButton(f5, text="▶", width=40, state="disabled", command=self._play)
+        self.play_btn.pack(side="left", padx=(0, 2))
+        self.open_btn = ctk.CTkButton(f5, text="📂", width=40, state="disabled", command=self._open_folder)
         self.open_btn.pack(side="left", padx=(0, 8))
 
     # ------------------------------------------------------------------
@@ -174,44 +187,38 @@ class GachiRemixGUI(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _on_backend_change(self, choice: str):
-        cfg = BACKENDS.get(choice, {})
+        cfg = BACKEND_CONFIG.get(choice, {})
         self.model_entry.delete(0, "end")
         self.model_entry.insert(0, cfg.get("model", ""))
         if choice == "none":
-            self.api_key_entry.configure(state="disabled", placeholder_text="—")
+            self.key_entry.configure(state="disabled", placeholder_text="—")
         else:
-            self.api_key_entry.configure(state="normal", placeholder_text="sk-... (необязательно)")
-
-    def _on_volume(self, val):
-        self.volume_label.configure(text=f"{int(val)}%")
-
-    def _on_random(self, val):
-        self.random_label.configure(text=f"{int(val)}%")
+            self.key_entry.configure(state="normal", placeholder_text="sk-...")
 
     def _check_ffmpeg(self):
         try:
             check_ffmpeg()
-            self._log("✅ FFmpeg найден")
         except SystemExit:
             self._log("❌ FFmpeg не найден! Установите: https://ffmpeg.org/download.html")
-            messagebox.showerror("Ошибка", "FFmpeg не найден. Установите FFmpeg.")
+            messagebox.showerror("Ffmpeg Error", "FFmpeg не найден. Установите FFmpeg.")
 
     def _browse_file(self):
         path = filedialog.askopenfilename(
-            title="Выберите аудиофайл",
+            title="Выберите файл",
             filetypes=[("Аудио/Видео", "*.mp3 *.wav *.ogg *.flac *.m4a *.mp4 *.mov *.avi"),
                        ("Все файлы", "*.*")],
         )
         if path:
-            self.input_path = path
-            self.file_label.configure(text=os.path.basename(path))
-            self._log(f"Файл: {path}")
-            dur = get_duration(path)
-            if dur > 0:
-                backend = self.backend_var.get()
-                from gachi_remix import estimate_cost
-                cost = estimate_cost(backend, dur)
-                self._log(f"  Длительность: {dur:.0f}s | Оценка ~{cost}")
+            self._set_file(path)
+
+    def _set_file(self, path: str):
+        self.input_path = path
+        self.file_label.configure(text=os.path.basename(path))
+        self._log(f"Файл: {path}")
+        dur = get_duration(path)
+        if dur > 0:
+            cost = estimate_cost(self.backend_var.get(), dur)
+            self._log(f"  Длит: {dur:.0f}s | ~{cost}")
 
     def _log(self, msg: str):
         self.log_text.configure(state="normal")
@@ -222,10 +229,8 @@ class GachiRemixGUI(ctk.CTk):
     def _on_log(self, msg: str):
         self.after(0, self._log, msg)
 
-    def _set_running(self, running: bool):
-        self._running = running
-        state = "disabled" if running else "normal"
-        self.gen_btn.configure(state=state, text="⏳ Генерация..." if running else "🎵  Сгенерировать gachi-ремикс")
+    def _set_status(self, text: str):
+        self.status_label.configure(text=text)
 
     # ------------------------------------------------------------------
     # Generate
@@ -242,13 +247,14 @@ class GachiRemixGUI(ctk.CTk):
         self.play_btn.configure(state="disabled")
         self.open_btn.configure(state="disabled")
         self.out_label.configure(text="⏳")
-
         self.progress.set(0)
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        self._set_status("Подготовка...")
 
-        self._set_running(True)
+        self._running = True
+        self.gen_btn.configure(state="disabled", text="⏳  Генерация...")
         threading.Thread(target=self._generate_thread, daemon=True).start()
 
     def _generate_thread(self):
@@ -259,17 +265,22 @@ class GachiRemixGUI(ctk.CTk):
             import traceback
             traceback.print_exc()
         finally:
-            self.after(0, lambda: self.gen_btn.configure(state="normal", text="🎵  Сгенерировать gachi-ремикс"))
-            self._running = False
+            self.after(0, self._on_done)
+
+    def _on_done(self):
+        self._running = False
+        self.gen_btn.configure(state="normal", text="🎵  Сгенерировать")
+        self._set_status("")
 
     def _do_generate(self):
         from pathlib import Path as P
+        import random as rnd
 
         backend = self.backend_var.get()
-        api_key = self.api_key_entry.get().strip() or None
+        api_key = self.key_entry.get().strip() or None
         whisper_model = self.whisper_var.get()
-        volume = self.volume_slider.get()
-        random_chance = self.random_slider.get() / 100
+        volume = self.vol_slider.get()
+        random_chance = self.rnd_slider.get() / 100
         no_fallback = self.no_fallback_var.get()
         dry_run = self.dry_run_var.get()
         llm_model = self.model_entry.get().strip()
@@ -278,11 +289,12 @@ class GachiRemixGUI(ctk.CTk):
         sounds_dir = P(__file__).parent / "sounds"
         output_path = str(input_path.with_name(input_path.stem + "_gachi_remix.mp3"))
 
-        self.after(0, lambda: self._log(f"🔧 Бэкенд: {backend} | Модель: {llm_model or '-'}"))
+        self.after(0, lambda: self._log(f"🔧 {backend} | {llm_model}"))
+        self.after(0, lambda: self.progress.configure(value=0.05))
+        self.after(0, lambda: self._set_status("Загрузка звуков..."))
 
         library = SoundLibrary(str(sounds_dir))
-        self.after(0, lambda: self._log(f"📁 Звуков: {len(library.all_sounds)}"))
-        self.after(0, lambda: self.progress.configure(value=0.05))
+        self.after(0, lambda: self._log(f"📁 {len(library.all_sounds)} звуков"))
 
         has_video = input_path.suffix.lower() in (".mp4", ".mov", ".avi")
         audio_path = input_path
@@ -290,50 +302,60 @@ class GachiRemixGUI(ctk.CTk):
         if has_video:
             import tempfile
             tmp = P(tempfile.mkdtemp()) / f"{input_path.stem}_audio.mp3"
-            self.after(0, lambda: self._log("🎬 Извлекаю аудио из видео..."))
-            import subprocess
+            self.after(0, lambda: self._log("🎬 Извлекаю аудио..."))
+            self.after(0, lambda: self._set_status("Извлечение аудио из видео..."))
             subprocess.run(["ffmpeg", "-y", "-i", str(input_path), "-q:a", "0",
                             "-map", "a", str(tmp)], capture_output=True, check=True, timeout=120)
             audio_path = tmp
             self.after(0, lambda: self.progress.configure(value=0.1))
 
-        self.after(0, lambda: self._log("🎤 Распознаю текст (Whisper)..."))
+        self.after(0, lambda: self._set_status("Распознавание речи (Whisper)..."))
+        self.after(0, lambda: self._log("🎤 Распознаю текст..."))
         segments = transcribe(str(audio_path), whisper_model, None, "cpu")
         self.after(0, lambda: self.progress.configure(value=0.35))
         has_words = any(seg.words for seg in segments)
 
+        # Cost & confirm (via Event, safe from worker thread)
+        if has_words and backend in ("deepseek", "openai") and api_key and not dry_run:
+            dur = get_duration(str(audio_path))
+            cost = estimate_cost(backend, dur)
+            ev = threading.Event()
+            result = [False]
+            def ask():
+                result[0] = messagebox.askokcancel("Подтверждение", f"{backend}\nОценка: {cost}\nПродолжить?")
+                ev.set()
+            self.after(0, ask)
+            ev.wait()
+            if not result[0]:
+                self.after(0, lambda: self._log("  Отменено"))
+                return
+
         placements: list[Placement] = []
         used: dict[str, int] = {}
 
-        # AI matching
+        # AI match
         if has_words and backend != "none":
-            cfg = BACKENDS.get(backend, {})
-            dur = get_duration(str(audio_path))
-            from gachi_remix import estimate_cost
-            cost = estimate_cost(backend, dur)
-            self.after(0, lambda: self._log(f"🧠 {backend.capitalize()}: ~{cost}"))
-            if backend in ("deepseek", "openai") and cost != "0 (free)" and not dry_run:
-                ok = messagebox.askokcancel("Подтверждение", f"Будет потрачено ~{cost}. Продолжить?")
-                if not ok:
-                    self.after(0, lambda: self._log("  Отменено пользователем"))
-                    self.after(0, lambda: self.gen_btn.configure(state="normal", text="🎵  Сгенерировать gachi-ремикс"))
-                    self._running = False
-                    return
+            cfg = BACKEND_CONFIG.get(backend, {})
+            cost = estimate_cost(backend, get_duration(str(audio_path)))
+            self.after(0, lambda b=backend, c=cost: self._log(f"🧠 {b}: ~{c}"))
+            self.after(0, lambda: self._set_status(f"AI матчинг ({backend})..."))
 
+            from gachi_remix import llm_match_openai, llm_match_gemini
+            mp = 15
             if backend == "gemini":
-                ai_p = llm_match_gemini(segments, library, api_key or "")
+                ai_p = llm_match_gemini(segments, library, api_key or "", mp)
             else:
                 url = cfg.get("url", "http://localhost:11434/v1")
-                key = api_key or "ollama" if backend == "ollama" else api_key or ""
-                ai_p = llm_match_openai(segments, library, url, llm_model or cfg.get("model", ""), key, max_placements=15)
-
+                key = api_key or ("ollama" if backend == "ollama" else api_key or "")
+                ai_p = llm_match_openai(segments, library, url,
+                                        llm_model or cfg.get("model", ""), key, mp)
             for pl in ai_p:
                 placements.append(pl)
                 used[pl.sound] = used.get(pl.sound, 0) + 1
-            self.after(0, lambda: self._log(f"  {backend}: {len(ai_p)} placement'ов"))
+            self.after(0, lambda: self._log(f"  AI: {len(ai_p)} placements"))
             self.after(0, lambda: self.progress.configure(value=0.5))
 
-        # Rules fallback
+        # Rules
         if not no_fallback and has_words:
             cnt = 0
             for seg in segments:
@@ -344,54 +366,43 @@ class GachiRemixGUI(ctk.CTk):
                         used[match] = used.get(match, 0) + 1
                         cnt += 1
             if cnt:
-                self.after(0, lambda: self._log(f"  Правила: {cnt} placement'ов"))
+                self.after(0, lambda: self._log(f"  Правила: {cnt}"))
             self.after(0, lambda: self.progress.configure(value=0.6))
 
-        # Random on pauses
+        # Random
         if random_chance > 0 and has_words:
+            from gachi_remix import find_pauses
             pauses = find_pauses(segments, 0.8)
             cnt = 0
-            import random as rnd
             for p in pauses:
                 if rnd.random() < random_chance:
-                    placements.append(Placement(start=p["start"], sound=library.random()))
+                    placements.append(Placement(start=p.start, sound=library.random()))
                     cnt += 1
             if cnt:
-                self.after(0, lambda: self._log(f"  Случайно: {cnt} placement'ов"))
+                self.after(0, lambda: self._log(f"  Случайно: {cnt}"))
 
-        # Instrumental fallback
+        # Instrumental
         if not placements and not has_words:
-            dur = getattr(audio_path, "stat", lambda: None) and 30
-            for t in range(2, int(dur) - 1, 3) if dur else range(2, 30, 3):
+            dur = get_duration(str(audio_path)) or 30
+            for t in range(2, int(dur) - 1, 3):
                 placements.append(Placement(start=float(t), sound=library.random()))
-            self.after(0, lambda: self._log(f"  Инструментал: {len(placements)} placement'ов"))
+            self.after(0, lambda: self._log(f"  Инстр: {len(placements)}"))
 
         if not placements:
-            self.after(0, lambda: self._log("⚠️ Нет placement'ов — копирую оригинал"))
+            self.after(0, lambda: self._log("⚠️ Нет вставок — копирую оригинал"))
             import shutil
             shutil.copy2(str(audio_path), output_path)
             self.after(0, lambda: self._finish(output_path))
             return
 
-        placements.sort(key=lambda x: x.start)
-        deduped = []
-        last_t = -99
-        for pl in placements:
-            t = int(pl.start)
-            if t != last_t:
-                deduped.append(pl)
-                last_t = t
-            elif len(deduped) >= 2 and deduped[-2].sound == pl.sound:
-                deduped.append(pl)
-                last_t = t
-        placements = deduped
+        from gachi_remix import deduplicate
+        placements = deduplicate(placements)
 
-        self.after(0, lambda: self._log(f"🎯 Итого: {len(placements)} уникальных вставок"))
-        for pl in placements[:6]:
+        self.after(0, lambda: self._log(f"🎯 Итого: {len(placements)} вставок"))
+        for pl in placements[:5]:
             self.after(0, lambda p=pl: self._log(f"  [{p.start:6.2f}s] {P(p.sound).name}"))
-        if len(placements) > 6:
-            self.after(0, lambda: self._log(f"  ... и ещё {len(placements)-6}"))
-
+        if len(placements) > 5:
+            self.after(0, lambda: self._log(f"  ... +{len(placements)-5}"))
         self.after(0, lambda: self.progress.configure(value=0.75))
 
         if dry_run:
@@ -400,17 +411,20 @@ class GachiRemixGUI(ctk.CTk):
             self.after(0, lambda: self.out_label.configure(text="dry-run"))
             return
 
-        # Mix
+        self.after(0, lambda: self._set_status("Микширование через FFmpeg..."))
         self.after(0, lambda: self._log("🎛️  Микширую..."))
+        from gachi_remix import mix
         mix_path = audio_path if not has_video else input_path
         mix(str(mix_path), placements, output_path, volume)
         self.after(0, lambda: self.progress.configure(value=1.0))
+        self.after(0, lambda: self._set_status(""))
         self.after(0, lambda: self._finish(output_path))
 
     def _finish(self, path: str):
         self.output_path = path
         sz = os.path.getsize(path)
-        self.out_label.configure(text=f"{os.path.basename(path)} ({sz/1024/1024:.1f} MB)")
+        name = os.path.basename(path)
+        self.out_label.configure(text=f"{name} ({sz/1024/1024:.1f} MB)")
         self.play_btn.configure(state="normal")
         self.open_btn.configure(state="normal")
         self._log(f"✅ Готово: {path}")
@@ -420,13 +434,27 @@ class GachiRemixGUI(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _play(self):
-        if self.output_path and os.path.isfile(self.output_path):
+        if not self.output_path or not os.path.isfile(self.output_path):
+            return
+        if sys.platform == "win32":
             os.startfile(self.output_path)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", self.output_path])
+        else:
+            subprocess.run(["xdg-open", self.output_path])
 
     def _open_folder(self):
-        if self.output_path:
-            os.startfile(os.path.dirname(self.output_path))
+        if not self.output_path:
+            return
+        folder = os.path.dirname(self.output_path)
+        if sys.platform == "win32":
+            os.startfile(folder)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", folder])
+        else:
+            subprocess.run(["xdg-open", folder])
 
 
 if __name__ == "__main__":
-    GachiRemixGUI().mainloop()
+    app = GachiRemixGUI()
+    app.mainloop()
