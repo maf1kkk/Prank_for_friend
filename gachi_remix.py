@@ -348,7 +348,8 @@ def main() -> None:
         epilog=(
             "Примеры:\n"
             "  %(prog)s track.mp3\n"
-            "  %(prog)s track.mp3 --backend ollama --llm-model qwen2.5:7b\n"
+            "  %(prog)s track.mp3 --backend ollama\n"
+            "  %(prog)s track.mp3 --backend deepseek --api-key sk-...\n"
             "  %(prog)s track.mp3 --backend gemini --api-key KEY\n"
             "  %(prog)s track.mp3 --dry-run --save-placements plan.json\n"
             "  %(prog)s папка/ --output-dir remixes/\n"
@@ -361,13 +362,13 @@ def main() -> None:
     )
     p.add_argument("input", help="Файл или папка с треками")
     p.add_argument("--backend", default="ollama",
-                   choices=["ollama", "openai", "gemini", "none"],
+                   choices=["ollama", "deepseek", "openai", "gemini", "none"],
                    help="Бэкенд для AI (def: ollama — локальный, без ключей)")
     p.add_argument("--api-key", help="API ключ (для gemini/openai)")
     p.add_argument("--llm-url", default="http://localhost:11434/v1",
                    help="URL для OpenAI-совместимого API (def: http://localhost:11434/v1)")
-    p.add_argument("--llm-model", default="qwen2.5:7b",
-                   help="Модель LLM (def: qwen2.5:7b)")
+    p.add_argument("--llm-model",
+                   help="Модель LLM (def: qwen2.5:7b для ollama, deepseek-chat для deepseek)")
     p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
                    help="Папка со звуками (def: ./sounds)")
     p.add_argument("--output", "-o", help="Выходной файл")
@@ -393,6 +394,9 @@ def main() -> None:
     p.add_argument("--debug", action="store_true", help="Debug-логи")
 
     args = p.parse_args()
+
+    if not args.llm_model:
+        args.llm_model = "deepseek-chat" if args.backend == "deepseek" else "qwen2.5:7b"
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -482,6 +486,19 @@ def _process_file(input_path: Path, output_path: str,
                     placements.append(pl)
                     used[pl.sound] = used.get(pl.sound, 0) + 1
                 log.info("  Gemini: %d placements", len(ai_p))
+        elif args.backend == "deepseek":
+            key = args.api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+            if not key:
+                log.warning("--backend deepseek requires --api-key")
+            else:
+                log.info("DeepSeek matching (%s)...", args.llm_model)
+                ai_p = llm_match_openai(segments, library,
+                                        "https://api.deepseek.com/v1",
+                                        args.llm_model, key)
+                for pl in ai_p:
+                    placements.append(pl)
+                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                log.info("  DeepSeek: %d placements", len(ai_p))
         elif args.backend == "ollama":
             log.info("Ollama matching (%s)...", args.llm_model)
             ai_p = llm_match_openai(segments, library, args.llm_url,
