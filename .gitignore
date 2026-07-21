@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
-*.spec
 build/
+dist/
+*.egg-info/
 installer_config.json
