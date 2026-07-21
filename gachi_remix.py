@@ -169,14 +169,15 @@ Available sounds (keyword -> filename):
 Rules:
 - Match sounds to contextual words or nearby words in the lyrics
 - Place the sound RIGHT BEFORE the relevant word (not on it)
-- 2-5 inserts per minute for natural feel
+- At most {max_p} inserts total, spread across the whole track
 - Prioritize: cum/fuck/yeah/ah/oh/slap sounds at lewd/excited moments
 - Be creative — think like a DJ making a mashup
 
 Return ONLY a JSON array of {{"start": <seconds>, "sound": "<filename>"}}.
-No markdown, no explanation."""
+No markdown, no explanation. Max {max_p} items."""
 
-def _build_llm_prompt(segments: list[Segment], library: SoundLibrary) -> str:
+def _build_llm_prompt(segments: list[Segment], library: SoundLibrary,
+                      max_p: int = 15) -> str:
     sound_lines = sorted(set(
         f"{kw:12s} -> {Path(v).stem}"
         for kw, vals in library.by_keyword.items()
@@ -192,7 +193,7 @@ def _build_llm_prompt(segments: list[Segment], library: SoundLibrary) -> str:
         lyrics_lines = [f"[{seg.start:.2f}] {seg.text}" for seg in segments]
     lyrics = "\n".join(lyrics_lines)
 
-    prompt = LLM_SYSTEM.format(sound_list=sound_list)
+    prompt = LLM_SYSTEM.format(sound_list=sound_list, max_p=max_p)
     prompt += f"\n\nLyrics:\n{lyrics}"
     return prompt
 
@@ -201,24 +202,31 @@ def _parse_llm_response(text: str, library: SoundLibrary) -> list[Placement]:
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     data = json.loads(text)
+    if not isinstance(data, list):
+        log.warning("  LLM: response is not a list")
+        return []
     placements = []
     for item in data:
-        spath = library.lookup(item.get("sound", ""))
-        if spath:
-            placements.append(Placement(
-                start=float(item["start"]), sound=spath,
-            ))
+        try:
+            spath = library.lookup(item.get("sound", ""))
+            if spath:
+                placements.append(Placement(
+                    start=float(item["start"]), sound=spath,
+                ))
+        except (TypeError, ValueError, KeyError):
+            continue
     return placements
 
 
 def llm_match_openai(segments: list[Segment], library: SoundLibrary,
-                     api_url: str, model: str, api_key: str = "ollama") -> list[Placement]:
-    from openai import OpenAI
+                     api_url: str, model: str, api_key: str = "ollama",
+                     max_placements: int = 15) -> list[Placement]:
+    from openai import OpenAI, AuthenticationError, RateLimitError, APIStatusError
 
-    client = OpenAI(base_url=api_url, api_key=api_key)
-    prompt = _build_llm_prompt(segments, library)
+    client = OpenAI(base_url=api_url, api_key=api_key, max_retries=0)
+    prompt = _build_llm_prompt(segments, library, max_placements)
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -227,40 +235,53 @@ def llm_match_openai(segments: list[Segment], library: SoundLibrary,
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
-                max_tokens=4096,
+                max_tokens=2048,
             )
             text = resp.choices[0].message.content or ""
             return _parse_llm_response(text, library)
+        except AuthenticationError:
+            log.error("  LLM: invalid API key")
+            return []
+        except RateLimitError:
+            log.warning("  LLM: rate limited (attempt %d)", attempt + 1)
+            if attempt == 0:
+                time.sleep(3)
+        except APIStatusError as e:
+            log.warning("  LLM: API error %s (attempt %d)", e.status_code, attempt + 1)
+            if attempt == 0:
+                time.sleep(2)
         except json.JSONDecodeError:
             log.warning("  LLM: malformed JSON (attempt %d)", attempt + 1)
         except Exception as exc:
-            log.warning("  LLM: %s (attempt %d)", exc, attempt + 1)
+            log.warning("  LLM: %s (no retry)", exc)
+            return []
         time.sleep(1)
     return []
 
 
 def llm_match_gemini(segments: list[Segment], library: SoundLibrary,
-                     api_key: str) -> list[Placement]:
+                     api_key: str, max_placements: int = 15) -> list[Placement]:
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    prompt = _build_llm_prompt(segments, library)
+    prompt = _build_llm_prompt(segments, library, max_placements)
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             resp = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.7, max_output_tokens=4096,
+                    temperature=0.7, max_output_tokens=2048,
                 ),
             )
             return _parse_llm_response(resp.text, library)
         except json.JSONDecodeError:
             log.warning("  Gemini: malformed JSON (attempt %d)", attempt + 1)
         except Exception as exc:
-            log.warning("  Gemini: %s (attempt %d)", exc, attempt + 1)
+            log.warning("  Gemini: %s (no retry)", exc)
+            return []
         time.sleep(1)
     return []
 
@@ -337,6 +358,25 @@ def mix(original_path: str | Path, placements: list[Placement],
         shutil.copy2(str(original_path), str(output_path))
 
 # ---------------------------------------------------------------------------
+# Cost helpers
+# ---------------------------------------------------------------------------
+
+def estimate_cost(backend: str, duration_sec: float) -> str:
+    estimates = {
+        "deepseek":  (0.0002, 0.0004),  # $ per 1k tokens in/out
+        "gemini":    (0.000,  0.000),    # free tier
+        "ollama":    (0, 0),
+        "openai":    (0.0015, 0.0060),   # gpt-4o-mini
+    }
+    rate_in, rate_out = estimates.get(backend, (0, 0))
+    est_in = int(duration_sec * 2) + 200  # ~200-800 tokens
+    est_out = 300
+    cost = (est_in / 1000 * rate_in) + (est_out / 1000 * rate_out)
+    if cost == 0:
+        return "0 (free)"
+    return f"~${cost:.4f} (~{cost * 100:.2f} cents)"
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -364,11 +404,15 @@ def main() -> None:
     p.add_argument("--backend", default="ollama",
                    choices=["ollama", "deepseek", "openai", "gemini", "none"],
                    help="Бэкенд для AI (def: ollama — локальный, без ключей)")
-    p.add_argument("--api-key", help="API ключ (для gemini/openai)")
+    p.add_argument("--api-key", help="API ключ (для gemini/openai/deepseek)")
     p.add_argument("--llm-url", default="http://localhost:11434/v1",
                    help="URL для OpenAI-совместимого API (def: http://localhost:11434/v1)")
     p.add_argument("--llm-model",
                    help="Модель LLM (def: qwen2.5:7b для ollama, deepseek-chat для deepseek)")
+    p.add_argument("--max-placements", type=int, default=15,
+                   help="Максимум вставок от AI (def: 15)")
+    p.add_argument("--max-files", type=int, default=5,
+                   help="Максимум файлов при batch-обработке (def: 5)")
     p.add_argument("--sounds", default=str(Path(__file__).parent / "sounds"),
                    help="Папка со звуками (def: ./sounds)")
     p.add_argument("--output", "-o", help="Выходной файл")
@@ -390,6 +434,8 @@ def main() -> None:
                    help="Не создавать файл, только показать placements")
     p.add_argument("--save-placements", help="Сохранить placements в JSON")
     p.add_argument("--load-placements", help="Загрузить placements из JSON")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Автоматически подтверждать batch-обработку")
     p.add_argument("--verbose", "-v", action="store_true", help="Подробные логи")
     p.add_argument("--debug", action="store_true", help="Debug-логи")
 
@@ -424,6 +470,14 @@ def main() -> None:
         if not files:
             log.error("No audio/video files in %s", input_path)
             sys.exit(1)
+        if len(files) > args.max_files and not args.yes:
+            ans = input(f"  {len(files)} files found. Max {args.max_files}. Continue? [y/N] ")
+            if ans.lower() != "y":
+                log.info("Aborted")
+                sys.exit(0)
+            files = files[:args.max_files]
+        elif len(files) > args.max_files:
+            files = files[:args.max_files]
         log.info("Batch: %d files", len(files))
     else:
         files = [input_path]
@@ -460,6 +514,11 @@ def _process_file(input_path: Path, output_path: str,
     segments = transcribe(audio_path, args.model, args.lang, args.device)
     has_words = any(seg.words for seg in segments)
 
+    if has_words and args.backend != "none" and not args.load_placements:
+        dur = get_duration(audio_path)
+        cost_str = estimate_cost(args.backend, dur)
+        log.info("  ~Cost: %s", cost_str)
+
     placements: list[Placement] = []
     used: dict[str, int] = {}
 
@@ -476,15 +535,14 @@ def _process_file(input_path: Path, output_path: str,
 
     # 2. LLM / AI matching
     if not args.load_placements and has_words:
+        mp = min(args.max_placements, 30)
         if args.backend == "gemini":
             if not args.api_key:
                 log.warning("--backend gemini requires --api-key")
             else:
                 log.info("Gemini matching...")
-                ai_p = llm_match_gemini(segments, library, args.api_key)
-                for pl in ai_p:
-                    placements.append(pl)
-                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                ai_p = llm_match_gemini(segments, library, args.api_key, mp)
+                _add_placements(ai_p, placements, used)
                 log.info("  Gemini: %d placements", len(ai_p))
         elif args.backend == "deepseek":
             key = args.api_key or os.environ.get("DEEPSEEK_API_KEY", "")
@@ -494,18 +552,14 @@ def _process_file(input_path: Path, output_path: str,
                 log.info("DeepSeek matching (%s)...", args.llm_model)
                 ai_p = llm_match_openai(segments, library,
                                         "https://api.deepseek.com/v1",
-                                        args.llm_model, key)
-                for pl in ai_p:
-                    placements.append(pl)
-                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                                        args.llm_model, key, mp)
+                _add_placements(ai_p, placements, used)
                 log.info("  DeepSeek: %d placements", len(ai_p))
         elif args.backend == "ollama":
             log.info("Ollama matching (%s)...", args.llm_model)
             ai_p = llm_match_openai(segments, library, args.llm_url,
-                                    args.llm_model)
-            for pl in ai_p:
-                placements.append(pl)
-                used[pl.sound] = used.get(pl.sound, 0) + 1
+                                    args.llm_model, max_placements=mp)
+            _add_placements(ai_p, placements, used)
             log.info("  Ollama: %d placements", len(ai_p))
         elif args.backend == "openai":
             log.info("OpenAI matching (%s)...", args.llm_model)
@@ -514,10 +568,8 @@ def _process_file(input_path: Path, output_path: str,
                 log.warning("OPENAI_API_KEY not set")
             else:
                 ai_p = llm_match_openai(segments, library, args.llm_url,
-                                        args.llm_model, key)
-                for pl in ai_p:
-                    placements.append(pl)
-                    used[pl.sound] = used.get(pl.sound, 0) + 1
+                                        args.llm_model, key, mp)
+                _add_placements(ai_p, placements, used)
                 log.info("  OpenAI: %d placements", len(ai_p))
 
     # 3. Rules-based fallback (when AI fails or disabled)
@@ -592,6 +644,13 @@ def _process_file(input_path: Path, output_path: str,
 
     mix(audio_path if not has_video else input_path,
         placements, output_path, args.volume)
+
+
+def _add_placements(ai_p: list[Placement], placements: list[Placement],
+                    used: dict[str, int]) -> None:
+    for pl in ai_p:
+        placements.append(pl)
+        used[pl.sound] = used.get(pl.sound, 0) + 1
 
 
 def _extract_audio(video_path: Path) -> Path:

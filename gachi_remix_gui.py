@@ -206,6 +206,12 @@ class GachiRemixGUI(ctk.CTk):
             self.input_path = path
             self.file_label.configure(text=os.path.basename(path))
             self._log(f"Файл: {path}")
+            dur = get_duration(path)
+            if dur > 0:
+                backend = self.backend_var.get()
+                from gachi_remix import estimate_cost
+                cost = estimate_cost(backend, dur)
+                self._log(f"  Длительность: {dur:.0f}s | Оценка ~{cost}")
 
     def _log(self, msg: str):
         self.log_text.configure(state="normal")
@@ -253,7 +259,8 @@ class GachiRemixGUI(ctk.CTk):
             import traceback
             traceback.print_exc()
         finally:
-            self.after(0, lambda: self._set_running(False))
+            self.after(0, lambda: self.gen_btn.configure(state="normal", text="🎵  Сгенерировать gachi-ремикс"))
+            self._running = False
 
     def _do_generate(self):
         from pathlib import Path as P
@@ -301,14 +308,24 @@ class GachiRemixGUI(ctk.CTk):
         # AI matching
         if has_words and backend != "none":
             cfg = BACKENDS.get(backend, {})
-            self.after(0, lambda: self._log(f"🧠 {backend.capitalize()} матчинг..."))
+            dur = get_duration(str(audio_path))
+            from gachi_remix import estimate_cost
+            cost = estimate_cost(backend, dur)
+            self.after(0, lambda: self._log(f"🧠 {backend.capitalize()}: ~{cost}"))
+            if backend in ("deepseek", "openai") and cost != "0 (free)" and not dry_run:
+                ok = messagebox.askokcancel("Подтверждение", f"Будет потрачено ~{cost}. Продолжить?")
+                if not ok:
+                    self.after(0, lambda: self._log("  Отменено пользователем"))
+                    self.after(0, lambda: self.gen_btn.configure(state="normal", text="🎵  Сгенерировать gachi-ремикс"))
+                    self._running = False
+                    return
 
             if backend == "gemini":
                 ai_p = llm_match_gemini(segments, library, api_key or "")
             else:
                 url = cfg.get("url", "http://localhost:11434/v1")
                 key = api_key or "ollama" if backend == "ollama" else api_key or ""
-                ai_p = llm_match_openai(segments, library, url, llm_model or cfg.get("model", ""), key)
+                ai_p = llm_match_openai(segments, library, url, llm_model or cfg.get("model", ""), key, max_placements=15)
 
             for pl in ai_p:
                 placements.append(pl)
